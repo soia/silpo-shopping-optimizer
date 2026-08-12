@@ -1,0 +1,326 @@
+# Setup
+
+Ten steps from an empty n8n instance to a working bot.
+
+```
+[x] Create the Telegram bot          → @SilpoBasketAIBot
+[x] Stand up n8n with a public URL
+[x] Create the three n8n data tables
+[ ] Generate TOKEN_ENCRYPTION_KEY and set it in n8n
+[ ] Create the Telegram credential in n8n
+[ ] (optional) Add an Anthropic key and re-enable the semantic check
+[ ] Import both workflows (two separate workflows, not one canvas)
+[ ] Publish both workflows
+[ ] Run the test scenario
+```
+
+---
+
+## 1. Telegram bot — done
+
+**Where:** @BotFather in Telegram.
+**Do:** `/newbot` → name → username.
+**Result:** bot **[@SilpoBasketAIBot](https://t.me/SilpoBasketAIBot)** ("Silpo
+Basket AI"), verified through `getMe`.
+**Goes into:** n8n → Credentials → Telegram API (step 7).
+
+The command menu and the bot description are already configured via
+`setMyCommands` / `setMyDescription`:
+
+```
+start    - Почати роботу
+connect  - Підключити акаунт Сільпо
+optimize - Оптимізувати кошик
+cart     - Показати кошик
+```
+
+> Bot tokens have been pasted into a chat during development. Run `/revoke` in
+> @BotFather and update the credential before any public demo.
+
+---
+
+## 2. n8n with a public HTTPS URL — done
+
+Needed twice: the Telegram webhook and the OAuth redirect.
+
+**Where:** [n8n.io](https://n8n.io) → Sign up (14-day trial).
+**Result:** a URL such as `https://your-instance.app.n8n.cloud`.
+**Goes into:** `.secrets/n8n.json` — see step 3.
+
+Self-hosted works too, but `WEBHOOK_URL` must point at a public domain or
+neither Telegram nor Silpo can reach the instance.
+
+---
+
+## 3. Data tables — done
+
+Storage lives inside n8n, so there is no external database and no credential for
+it. **Overview → Data tables**, three tables:
+
+| Table | Columns |
+|---|---|
+| `silpo_oauth_state` | `state` (string), `telegram_user_id` (number), `chat_id` (number), `code_verifier` (string), `client_id` (string) |
+| `silpo_sessions` | `telegram_user_id` (number), `client_id` (string), `access_token_enc` (string), `refresh_token_enc` (string), `expires_at` (string), `blocked_brands` (string) |
+| `optimization_plans` | `plan_id` (string), `telegram_user_id` (number), `cart_id` (string), `plan_json` (string), `original_total` (number), `status` (string) |
+
+n8n adds `id`, `createdAt` and `updatedAt` to every table automatically; the
+TTL checks use `createdAt`.
+
+> **If the tables already exist**, add the `blocked_brands` column (string) to
+> `silpo_sessions` — it holds the brand blocklist, pipe-separated. Without it
+> `/block` fails on write.
+
+> Table ids and the instance URL are compiled into the workflows. Put yours in
+> **`.secrets/n8n.json`** (gitignored) and rebuild:
+>
+> ```json
+> {
+>   "baseUrl": "https://your-instance.app.n8n.cloud",
+>   "tables": { "oauthState": "...", "sessions": "...", "plans": "..." }
+> }
+> ```
+>
+> ```bash
+> npm run build:workflows
+> ```
+>
+> An id is visible in the URL of each table in n8n. Recreating a table changes it.
+
+---
+
+## 4. Encryption key
+
+```bash
+openssl rand -hex 32
+```
+
+**Result:** 64 hex characters.
+**Goes into:** the `TOKEN_ENCRYPTION_KEY` variable (step 6).
+
+This key encrypts Silpo tokens at rest. Losing it forces every user to
+re-authorize.
+
+---
+
+## 5. Anthropic API key — currently skipped
+
+The workflow is built **without** the model call: `AI_SEMANTIC_CHECK = false` in
+`src/workflow/build.ts`. A node with no credential fails outright in n8n rather
+than routing through `onError`, so it is left out entirely instead of shipping a
+guaranteed error.
+
+The rule-based fallback takes its place and rejects replacements that break the
+purchase intent — protein products, lactose-free, no-added-sugar, baby food,
+fermented drinks. Verified on the real cart: it accepts the Snickers swap and
+rejects the protein dessert and the kombucha.
+
+To enable the model later:
+
+1. [console.anthropic.com](https://console.anthropic.com) → API Keys → Create Key
+   (\$5 of credit is plenty for a demo).
+2. n8n → Credentials → Anthropic API, named `Anthropic API`.
+3. Set `AI_SEMANTIC_CHECK = true` and run `npm run build:workflows`.
+4. Re-import `telegram-bot.json`.
+
+Expected effect: savings rise from about 96 UAH to roughly 200–280, because the
+model recognises cases the keyword rules reject too bluntly.
+
+---
+
+## 6. Variables
+
+**Where:** n8n → Settings → **Variables** → New variable.
+
+| Key | Scope | Required | Value |
+|---|---|---|---|
+| `TOKEN_ENCRYPTION_KEY` | **Global** | yes | 64 hex characters from step 4 |
+| `TELEGRAM_BOT_TOKEN` | **Global** | yes | the bot token from step 1 |
+| `N8N_BASE_URL` | Global | no | Overrides the URL compiled into the workflows |
+
+`TELEGRAM_BOT_TOKEN` duplicates what the Telegram credential already holds. It is
+needed because the selection card has one button per replacement, and the n8n
+Telegram node only renders a keyboard fixed at design time — those two messages
+go through the Bot API directly, and a Code node cannot read a credential.
+
+Pick **Global**, not Personal: the workflow reads the value on every execution,
+whoever triggered it.
+
+The Code nodes read these through `$vars` only. `$env` is never touched: n8n
+Cloud defines the object but throws *"access to env vars denied"* on any
+property read, so even a `typeof` guard does not help.
+
+The instance URL is compiled in, so only the encryption key has to be created.
+If the instance moves, either add `N8N_BASE_URL` or change `DEFAULT_BASE_URL`
+in `src/workflow/build.ts` and rebuild.
+
+There is deliberately no `SILPO_CLIENT_ID`: the client registers itself through
+Dynamic Client Registration.
+
+---
+
+## 7. Credentials
+
+n8n → Credentials → + Add credential. The names must match the workflow JSON:
+
+| Type | Name | Value |
+|---|---|---|
+| Telegram API | `Silpo Bot` | token from step 1 |
+
+One credential is all the current build needs. Storage is n8n's own data tables,
+and the Anthropic node is not in the workflow yet (step 5).
+
+---
+
+## 8. Import
+
+n8n → Workflows → Import from File:
+
+Import the personalised build, not the tracked one:
+
+1. `.secrets/workflows/telegram-bot.json` — 44 nodes
+2. `.secrets/workflows/oauth-callback.template.json` — 9 nodes
+
+The files under [`workflows/`](../workflows/) are the same workflows built with
+placeholder values, so the repository carries nobody's instance. `npm run
+build:workflows` writes both: placeholders to `workflows/`, and a copy wired to
+your `.secrets/n8n.json` under `.secrets/workflows/`.
+
+Check that credentialed nodes are not showing a red warning triangle; if they
+are, open the node and pick the credential from the list.
+
+---
+
+## 9. Publish and verify the redirect URI
+
+Publish both workflows — recent n8n Cloud replaced the "Active" toggle with
+**Publish / Unpublish** (workflow versioning). Until a workflow is published,
+neither the Telegram webhook nor the OAuth callback exists.
+
+Confirmation looks like *"Your workflow will now listen for events from
+Telegram"* and *"You can now make calls to your production webhook URL"*.
+
+> Changing the Telegram credential does **not** re-register the webhook.
+> Unpublish and publish again, otherwise Telegram keeps delivering to the old
+> bot. Telegram also never clears the previous bot's registration — call
+> `deleteWebhook` on it, or both bots will post into the same workflow.
+
+Open the **Webhook /silpo/callback** node and confirm its Production URL is
+exactly:
+
+```
+https://<your-instance>/webhook/silpo/callback
+```
+
+This is the `redirect_uri` compiled into the workflows and registered with
+Silpo. If the two disagree, sign-in fails with `redirect_uri_mismatch`.
+
+Quick check from a terminal — anything other than 404 means the webhook is live:
+
+```bash
+curl -o /dev/null -w '%{http_code}\n' \
+  'https://<your-instance>/webhook/silpo/callback?state=probe'
+```
+
+---
+
+## 10. Test scenario
+
+```
+1.  Open @SilpoBasketAIBot in Telegram
+2.  /start          → welcome message with the command list
+2a. /cart           → current cart contents + "Оптимізувати" button
+3.  /connect        → "🔗 Увійти в Сільпо" button
+4.  Tap it          → auth.silpo.ua → phone + OTP
+5.  Browser         → "Акаунт підключено"
+6.  Telegram        → "✅ Акаунт «Сільпо» підключено!"
+7.  /optimize       → progress message
+8.  after ~5–10 s   → savings card, one checkbox per replacement
+9.  tap a checkbox  → it unticks in place, totals recalculate
+10. "✅ Застосувати обране (N)" → only the ticked ones are applied
+11. /block <brand>  → that brand is never offered again
+12. /blocked        → the current list, /unblock removes
+10. Verify the total in the Silpo app
+```
+
+### Expected result
+
+From a real run on 2026-08-12 (14 items):
+
+```
+Before:   1042,30 UAH
+After:      945,49 UAH
+Saving:      96,81 UAH (9.3%)
+
+14 items analyzed · 5 replacements · 4 on promotion
+Loyalty bonuses: 34.24 (potential)
+```
+
+Those are fallback numbers, without an Anthropic key. With the key, expect
+roughly 200–280 UAH. Details in [engine-findings.md](engine-findings.md).
+
+---
+
+## What the bot's messages mean
+
+Three outcomes look like failures but are the guard rails working. Each is
+explained inline in Telegram; the reasoning is here.
+
+**📦 Відхилено через об'єм упаковки.** Silpo returns no pack size in any search
+response, only on cart lines — so the size of a replacement becomes visible only
+after it is added. The apply step adds it, re-reads the cart, and rolls it back
+when the pack falls outside 0.8–1.25× of the original. A 300 g sour cream
+replaced by 180 g is 4% cheaper per gram but 40% less product: two packs cost
+more than the original, so it is not a saving.
+
+**🚫 Немає в наявності — залишив оригінал.** `silpo_get_similar_products`
+reports availability that lags behind the cart: `available: true` with stock, for
+a product the cart marks «Очікується». The cart wins, and the original stays.
+
+**🔄 Підставив інший товар.** The first choice failed one of the two checks
+above, so the next confirmed candidate went in instead. Up to three candidates
+per line are carried in the plan for exactly this.
+
+None of these can be decided before the write, which is why the recommendation
+card says so up front rather than promising a saving it cannot yet guarantee.
+
+---
+
+## Troubleshooting
+
+**Bot silent.** The workflow is not published, or the webhook still points at a
+different bot. Check with
+`curl "https://api.telegram.org/bot<TOKEN>/getWebhookInfo"` — an empty `url`
+means Telegram has nowhere to deliver. No executions at all points the same way.
+
+**`redirect_uri_mismatch`.** The Webhook node's Production URL differs from
+`DEFAULT_BASE_URL` in `src/workflow/build.ts`. Compare character by character,
+trailing slash included.
+
+**`TOKEN_ENCRYPTION_KEY must be 64 hex chars`.** The variable is unset or
+malformed. Regenerate with `openssl rand -hex 32`.
+
+**"Доступ до акаунта втратив силу".** The refresh token failed; `/connect`
+again. Silpo access tokens last 30 days, so this should be rare.
+
+**Saving is 0 UAH.** A legitimate outcome: nothing in the cart has a cheaper
+equivalent that preserves the purchase. Branded items give a better demo.
+
+---
+
+## Local tooling
+
+Works without n8n — useful for debugging and for recording a demo:
+
+```bash
+npm install
+npm run authorize     # OAuth 2.1 + PKCE, dumps all 39 tool schemas
+npm run call -- silpo_get_my_shopping_cart
+npm run optimize      # full analysis of the real cart, read-only
+npm run check         # typecheck + regenerate + validate workflows
+npm run test:node     # run a generated Code node against live MCP
+```
+
+`npm run optimize` picks up `ANTHROPIC_API_KEY` from a local `.env` (see
+`.env.example`) to enable the semantic layer. Everything the deployed bot needs
+lives in n8n Variables and Credentials instead — a `.env` file plays no part in
+the deployment.

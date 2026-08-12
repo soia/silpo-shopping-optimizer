@@ -1,0 +1,2158 @@
+{
+  "name": "Silpo Shopping Optimizer — Telegram Bot",
+  "nodes": [
+    {
+      "parameters": {
+        "updates": [
+          "message",
+          "callback_query"
+        ],
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "telegram-trigger",
+      "name": "Telegram Trigger",
+      "type": "n8n-nodes-base.telegramTrigger",
+      "typeVersion": 1.1,
+      "position": [
+        -600,
+        0
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Resolves the user's intent. No secrets and no MCP calls happen here.\nconst items = [];\nfor (const item of $input.all()) {\n  const update = item.json;\n  const message = update.message || (update.callback_query && update.callback_query.message);\n  const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);\n  const text = ((update.message && update.message.text) || '').trim();\n  const callbackData = (update.callback_query && update.callback_query.data) || '';\n\n  let action = 'unknown';\n  let planId = null;\n\n  let toggleIndex = null;\n  let brandArg = null;\n\n  if (callbackData) {\n    // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>\n    const parts = callbackData.split(':');\n    action = parts[0] === 't' ? 'toggle' : parts[0];\n    planId = parts[1] || null;\n    if (action === 'toggle') toggleIndex = Number(parts[2]);\n  } else if (text.startsWith('/unblock')) {\n    // Sliced rather than matched: a regex literal here would lose its escapes\n    // passing through the generator's template literal.\n    action = 'unblock';\n    brandArg = text.slice('/unblock'.length).trim();\n  } else if (text.startsWith('/blocked')) {\n    action = 'blocked';\n  } else if (text.startsWith('/block')) {\n    action = 'block';\n    brandArg = text.slice('/block'.length).trim();\n  } else if (text.startsWith('/start')) action = 'start';\n  else if (text.startsWith('/connect')) action = 'connect';\n  else if (text.startsWith('/optimize') || text.includes('Оптимізувати')) action = 'optimize';\n  else if (text.startsWith('/cart')) action = 'cart';\n\n  items.push({ json: {\n    action,\n    planId,\n    toggleIndex,\n    brandArg,\n    chatId: message && message.chat && message.chat.id,\n    telegramUserId: from && from.id,\n    callbackQueryId: (update.callback_query && update.callback_query.id) || null,\n    messageId: (message && message.message_id) || null,\n    firstName: (from && from.first_name) || '',\n  }});\n}\nreturn items;\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "route-request",
+      "name": "Route Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -380,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_SESSIONS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "silpo_sessions"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "telegram_user_id",
+              "keyValue": "={{ $json.telegramUserId }}"
+            }
+          ]
+        }
+      },
+      "id": "load-session",
+      "name": "Load Session",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        -160,
+        0
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst crypto = require('crypto');\n\nfunction readVar(name) {\n  try {\n    return (typeof $vars !== 'undefined' && $vars[name]) || null;\n  } catch (e) {\n    return null;\n  }\n}\n\n\n// The Code-node sandbox is a restricted VM, not Node: there is no fetch, no URL\n// and no URLSearchParams, and require() is limited to an allowlist - 'crypto'\n// loads, 'url' and 'buffer' are rejected outright.\n//\n// Buffer is therefore taken from a real Buffer instance produced by crypto,\n// which needs no module and no global.\nconst Buf = require('crypto').randomBytes(0).constructor;\n\n// The node context is bound to 'this' only at the top level of a Code node;\n// inside a plain function call it is undefined. Capture the helper here.\nconst _nodeHelpers = (function () {\n  try {\n    return this && this.helpers ? this.helpers : null;\n  } catch (e) {\n    return null;\n  }\n}).call(this);\n\nfunction _toText(raw) {\n  if (raw === undefined || raw === null) return '';\n  if (typeof raw === 'string') return raw;\n  if (raw.constructor === Buf) return raw.toString('utf8');\n  if (raw.type === 'Buffer' && Array.isArray(raw.data)) return Buf.from(raw.data).toString('utf8');\n  return JSON.stringify(raw);\n}\n\nfunction sleep(ms) {\n  if (typeof setTimeout !== 'function') return Promise.resolve();\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}\n\nfunction toQuery(params) {\n  return Object.keys(params)\n    .filter((k) => params[k] !== undefined && params[k] !== null)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n}\n\nasync function httpFetch(url, opts) {\n  const method = (opts && opts.method) || 'GET';\n  const headers = (opts && opts.headers) || {};\n  const body = opts && opts.body;\n  const wrap = (status, headerObj, text) => ({\n    status,\n    text,\n    headers: { get: (n) => headerObj[String(n).toLowerCase()] },\n  });\n\n  // 1. Native fetch, when the runtime provides it.\n  if (typeof fetch === 'function') {\n    const res = await fetch(url, { method, headers, body });\n    return { status: res.status, text: await res.text(), headers: { get: (n) => res.headers.get(n) } };\n  }\n\n  // 2. n8n's own HTTP helper — the transport that actually exists on Cloud.\n  if (_nodeHelpers && _nodeHelpers.httpRequest) {\n    try {\n      const res = await _nodeHelpers.httpRequest({\n        url, method, headers, body,\n        json: false,\n        returnFullResponse: true,\n        ignoreHttpStatusErrors: true,\n      });\n      return wrap(res.statusCode || 200, res.headers || {}, _toText(res.body));\n    } catch (err) {\n      // Older helpers throw on non-2xx instead of honouring\n      // ignoreHttpStatusErrors. Recover the status so 401 and 429 stay visible\n      // to the retry logic rather than surfacing as a generic failure.\n      const response = err && err.response;\n      const status = (err && (err.statusCode || err.httpCode))\n        || (response && (response.statusCode || response.status));\n      if (status) {\n        return wrap(Number(status), (response && response.headers) || {}, _toText(response && response.body));\n      }\n      throw err;\n    }\n  }\n\n  // 3. Raw https module, if the allowlist happens to permit it.\n  let https;\n  try {\n    https = require('https');\n  } catch (e) {\n    throw new Error('NO_HTTP_TRANSPORT: sandbox has no fetch, no this.helpers.httpRequest and no https module');\n  }\n  // Parsed with string ops rather than a regex: escaping a regex through this\n  // template literal is how the previous build silently produced a comment.\n  const withoutScheme = String(url).replace('https://', '').replace('http://', '');\n  const firstSlash = withoutScheme.indexOf('/');\n  const hostPort = firstSlash === -1 ? withoutScheme : withoutScheme.slice(0, firstSlash);\n  const path = firstSlash === -1 ? '/' : withoutScheme.slice(firstSlash);\n  const colon = hostPort.indexOf(':');\n  const hostname = colon === -1 ? hostPort : hostPort.slice(0, colon);\n  const port = colon === -1 ? 443 : Number(hostPort.slice(colon + 1));\n\n  return await new Promise((resolve, reject) => {\n    const req = https.request(\n      { hostname, port, path, method, headers },\n      (res) => {\n        let data = '';\n        res.setEncoding('utf8');\n        res.on('data', (chunk) => { data += chunk; });\n        res.on('end', () => resolve(wrap(res.statusCode, res.headers || {}, data)));\n      },\n    );\n    req.on('error', reject);\n    if (body) req.write(body);\n    req.end();\n  });\n}\n\nfunction encKey() {\n  const k = readVar('TOKEN_ENCRYPTION_KEY');\n  if (!k || k.length !== 64) {\n    throw new Error('TOKEN_ENCRYPTION_KEY must be a 64-character hex string (openssl rand -hex 32), set under Settings → Variables with scope Global');\n  }\n  return Buf.from(k, 'hex');\n}\nfunction encrypt(plain) {\n  const iv = crypto.randomBytes(12);\n  const c = crypto.createCipheriv('aes-256-gcm', encKey(), iv);\n  const enc = Buf.concat([c.update(String(plain), 'utf8'), c.final()]);\n  return [iv.toString('hex'), c.getAuthTag().toString('hex'), enc.toString('hex')].join(':');\n}\nfunction decrypt(payload) {\n  const [ivHex, tagHex, dataHex] = String(payload).split(':');\n  const d = crypto.createDecipheriv('aes-256-gcm', encKey(), Buf.from(ivHex, 'hex'));\n  d.setAuthTag(Buf.from(tagHex, 'hex'));\n  return Buf.concat([d.update(Buf.from(dataHex, 'hex')), d.final()]).toString('utf8');\n}\n\n// The lookup returns zero or one row; join it back onto the routed intent.\nconst routed = $('Route Request').all().map(i => i.json);\nconst rows = $input.all().map(i => i.json).filter(r => r && r.telegram_user_id);\n\nreturn routed.map(r => {\n  const row = rows.find(x => String(x.telegram_user_id) === String(r.telegramUserId));\n  let session = null;\n  if (row && row.access_token_enc) {\n    session = {\n      client_id: row.client_id,\n      access_token: decrypt(row.access_token_enc),\n      refresh_token: decrypt(row.refresh_token_enc),\n      expires_at: row.expires_at,\n    };\n  }\n  const blockedBrands = row && row.blocked_brands\n    ? String(row.blocked_brands).split('|').map(b => b.trim()).filter(Boolean)\n    : [];\n  return { json: { ...r, authorized: Boolean(session), session, blockedBrands } };\n});\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "merge-session",
+      "name": "Merge Session",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        60,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "optimize"
+                  }
+                ]
+              },
+              "outputKey": "optimize"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "apply"
+                  }
+                ]
+              },
+              "outputKey": "apply"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "connect"
+                  }
+                ]
+              },
+              "outputKey": "connect"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "cancel"
+                  }
+                ]
+              },
+              "outputKey": "cancel"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "details"
+                  }
+                ]
+              },
+              "outputKey": "details"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "cart"
+                  }
+                ]
+              },
+              "outputKey": "cart"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "toggle"
+                  }
+                ]
+              },
+              "outputKey": "toggle"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "block"
+                  }
+                ]
+              },
+              "outputKey": "block"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "unblock"
+                  }
+                ]
+              },
+              "outputKey": "unblock"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "blocked"
+                  }
+                ]
+              },
+              "outputKey": "blocked"
+            }
+          ]
+        },
+        "options": {
+          "fallbackOutput": "extra",
+          "renameFallbackOutput": "other"
+        }
+      },
+      "id": "switch-action",
+      "name": "Switch Action",
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3.2,
+      "position": [
+        280,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\nconst crypto = require('crypto');\n\nfunction readVar(name) {\n  try {\n    return (typeof $vars !== 'undefined' && $vars[name]) || null;\n  } catch (e) {\n    return null;\n  }\n}\n\n\n// The Code-node sandbox is a restricted VM, not Node: there is no fetch, no URL\n// and no URLSearchParams, and require() is limited to an allowlist - 'crypto'\n// loads, 'url' and 'buffer' are rejected outright.\n//\n// Buffer is therefore taken from a real Buffer instance produced by crypto,\n// which needs no module and no global.\nconst Buf = require('crypto').randomBytes(0).constructor;\n\n// The node context is bound to 'this' only at the top level of a Code node;\n// inside a plain function call it is undefined. Capture the helper here.\nconst _nodeHelpers = (function () {\n  try {\n    return this && this.helpers ? this.helpers : null;\n  } catch (e) {\n    return null;\n  }\n}).call(this);\n\nfunction _toText(raw) {\n  if (raw === undefined || raw === null) return '';\n  if (typeof raw === 'string') return raw;\n  if (raw.constructor === Buf) return raw.toString('utf8');\n  if (raw.type === 'Buffer' && Array.isArray(raw.data)) return Buf.from(raw.data).toString('utf8');\n  return JSON.stringify(raw);\n}\n\nfunction sleep(ms) {\n  if (typeof setTimeout !== 'function') return Promise.resolve();\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}\n\nfunction toQuery(params) {\n  return Object.keys(params)\n    .filter((k) => params[k] !== undefined && params[k] !== null)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n}\n\nasync function httpFetch(url, opts) {\n  const method = (opts && opts.method) || 'GET';\n  const headers = (opts && opts.headers) || {};\n  const body = opts && opts.body;\n  const wrap = (status, headerObj, text) => ({\n    status,\n    text,\n    headers: { get: (n) => headerObj[String(n).toLowerCase()] },\n  });\n\n  // 1. Native fetch, when the runtime provides it.\n  if (typeof fetch === 'function') {\n    const res = await fetch(url, { method, headers, body });\n    return { status: res.status, text: await res.text(), headers: { get: (n) => res.headers.get(n) } };\n  }\n\n  // 2. n8n's own HTTP helper — the transport that actually exists on Cloud.\n  if (_nodeHelpers && _nodeHelpers.httpRequest) {\n    try {\n      const res = await _nodeHelpers.httpRequest({\n        url, method, headers, body,\n        json: false,\n        returnFullResponse: true,\n        ignoreHttpStatusErrors: true,\n      });\n      return wrap(res.statusCode || 200, res.headers || {}, _toText(res.body));\n    } catch (err) {\n      // Older helpers throw on non-2xx instead of honouring\n      // ignoreHttpStatusErrors. Recover the status so 401 and 429 stay visible\n      // to the retry logic rather than surfacing as a generic failure.\n      const response = err && err.response;\n      const status = (err && (err.statusCode || err.httpCode))\n        || (response && (response.statusCode || response.status));\n      if (status) {\n        return wrap(Number(status), (response && response.headers) || {}, _toText(response && response.body));\n      }\n      throw err;\n    }\n  }\n\n  // 3. Raw https module, if the allowlist happens to permit it.\n  let https;\n  try {\n    https = require('https');\n  } catch (e) {\n    throw new Error('NO_HTTP_TRANSPORT: sandbox has no fetch, no this.helpers.httpRequest and no https module');\n  }\n  // Parsed with string ops rather than a regex: escaping a regex through this\n  // template literal is how the previous build silently produced a comment.\n  const withoutScheme = String(url).replace('https://', '').replace('http://', '');\n  const firstSlash = withoutScheme.indexOf('/');\n  const hostPort = firstSlash === -1 ? withoutScheme : withoutScheme.slice(0, firstSlash);\n  const path = firstSlash === -1 ? '/' : withoutScheme.slice(firstSlash);\n  const colon = hostPort.indexOf(':');\n  const hostname = colon === -1 ? hostPort : hostPort.slice(0, colon);\n  const port = colon === -1 ? 443 : Number(hostPort.slice(colon + 1));\n\n  return await new Promise((resolve, reject) => {\n    const req = https.request(\n      { hostname, port, path, method, headers },\n      (res) => {\n        let data = '';\n        res.setEncoding('utf8');\n        res.on('data', (chunk) => { data += chunk; });\n        res.on('end', () => resolve(wrap(res.statusCode, res.headers || {}, data)));\n      },\n    );\n    req.on('error', reject);\n    if (body) req.write(body);\n    req.end();\n  });\n}\n\nconst b64url = b => b.toString('base64').replace(/\\+/g,'-').replace(/\\//g,'_').replace(/=+$/,'');\nconst N8N_BASE_URL = readVar('N8N_BASE_URL') || 'https://your-instance.app.n8n.cloud';\nconst REDIRECT_URI = N8N_BASE_URL.replace(/\\/$/, '') + '/webhook/silpo/callback';\n\nconst out = [];\nfor (const item of $input.all()) {\n  // Dynamic Client Registration: Silpo issues the client_id on demand, so no\n  // application has to be registered by hand. Verified: POST /register → 201,\n  // and no client_secret is returned (public client + PKCE).\n  const registration = await httpFetch('https://mcp.silpo.ua/register', {\n    method: 'POST',\n    headers: { 'content-type': 'application/json' },\n    body: JSON.stringify({\n      client_name: 'Silpo Shopping Optimizer',\n      redirect_uris: [REDIRECT_URI],\n      grant_types: ['authorization_code', 'refresh_token'],\n      response_types: ['code'],\n      token_endpoint_auth_method: 'none',\n      application_type: 'web',\n    }),\n  });\n  if (registration.status < 200 || registration.status >= 300) {\n    throw new Error('DCR_FAILED_' + registration.status + '_' + String(registration.text).slice(0, 120));\n  }\n  const client = JSON.parse(registration.text);\n\n  const verifier = b64url(crypto.randomBytes(32));\n  const challenge = b64url(crypto.createHash('sha256').update(verifier).digest());\n  const state = b64url(crypto.randomBytes(16));\n\n  const authUrl = 'https://mcp.silpo.ua/authorize?' + toQuery({\n    response_type: 'code',\n    client_id: client.client_id,\n    redirect_uri: REDIRECT_URI,\n    code_challenge: challenge,\n    code_challenge_method: 'S256',\n    state,\n    resource: 'https://mcp.silpo.ua/mcp',\n  });\n\n  out.push({ json: { ...item.json, authUrl, state, codeVerifier: verifier, clientId: client.client_id } });\n}\nreturn out;\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "build-auth-url",
+      "name": "Build Auth URL",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_OAUTH_STATE_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "silpo_oauth_state"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "state": "={{ $json.state }}",
+            "telegram_user_id": "={{ $json.telegramUserId }}",
+            "chat_id": "={{ $json.chatId }}",
+            "code_verifier": "={{ $json.codeVerifier }}",
+            "client_id": "={{ $json.clientId }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "state",
+              "displayName": "state",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "chat_id",
+              "displayName": "chat_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "code_verifier",
+              "displayName": "code_verifier",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "client_id",
+              "displayName": "client_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "save-oauth-state",
+      "name": "Save OAuth State",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        740,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Build Auth URL').item.json.chatId }}",
+        "text": "🔐 *Підключення акаунта «Сільпо»*\n\nНатисніть кнопку нижче та увійдіть за номером телефону.\nПісля входу поверніться сюди — я повідомлю про готовність.\n\n_Ваш токен зберігається зашифровано на сервері й ніколи не передається в Telegram._",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🔗 Увійти в Сільпо",
+                    "additionalFields": {
+                      "type": "url",
+                      "url": "={{ $('Build Auth URL').item.json.authUrl }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-login-link",
+      "name": "Send Login Link",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        -320
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "authed",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.authorized }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "is-authorized-",
+      "name": "Is Authorized?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        520,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "👋 Спершу підключіть акаунт «Сільпо» — інакше я не побачу ваш кошик.\n\nНатисніть /connect",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "ask-to-connect",
+      "name": "Ask To Connect",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        740,
+        160
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "🛒 Оптимізуємо ваш кошик...\n\n🔎 Перевіряю альтернативи\n🎁 Перевіряю акції\n🎟 Перевіряю купони\n💳 Перевіряю балабонуси",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-progress",
+      "name": "Send Progress",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        740,
+        -80
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\n\n// The Code-node sandbox is a restricted VM, not Node: there is no fetch, no URL\n// and no URLSearchParams, and require() is limited to an allowlist - 'crypto'\n// loads, 'url' and 'buffer' are rejected outright.\n//\n// Buffer is therefore taken from a real Buffer instance produced by crypto,\n// which needs no module and no global.\nconst Buf = require('crypto').randomBytes(0).constructor;\n\n// The node context is bound to 'this' only at the top level of a Code node;\n// inside a plain function call it is undefined. Capture the helper here.\nconst _nodeHelpers = (function () {\n  try {\n    return this && this.helpers ? this.helpers : null;\n  } catch (e) {\n    return null;\n  }\n}).call(this);\n\nfunction _toText(raw) {\n  if (raw === undefined || raw === null) return '';\n  if (typeof raw === 'string') return raw;\n  if (raw.constructor === Buf) return raw.toString('utf8');\n  if (raw.type === 'Buffer' && Array.isArray(raw.data)) return Buf.from(raw.data).toString('utf8');\n  return JSON.stringify(raw);\n}\n\nfunction sleep(ms) {\n  if (typeof setTimeout !== 'function') return Promise.resolve();\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}\n\nfunction toQuery(params) {\n  return Object.keys(params)\n    .filter((k) => params[k] !== undefined && params[k] !== null)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n}\n\nasync function httpFetch(url, opts) {\n  const method = (opts && opts.method) || 'GET';\n  const headers = (opts && opts.headers) || {};\n  const body = opts && opts.body;\n  const wrap = (status, headerObj, text) => ({\n    status,\n    text,\n    headers: { get: (n) => headerObj[String(n).toLowerCase()] },\n  });\n\n  // 1. Native fetch, when the runtime provides it.\n  if (typeof fetch === 'function') {\n    const res = await fetch(url, { method, headers, body });\n    return { status: res.status, text: await res.text(), headers: { get: (n) => res.headers.get(n) } };\n  }\n\n  // 2. n8n's own HTTP helper — the transport that actually exists on Cloud.\n  if (_nodeHelpers && _nodeHelpers.httpRequest) {\n    try {\n      const res = await _nodeHelpers.httpRequest({\n        url, method, headers, body,\n        json: false,\n        returnFullResponse: true,\n        ignoreHttpStatusErrors: true,\n      });\n      return wrap(res.statusCode || 200, res.headers || {}, _toText(res.body));\n    } catch (err) {\n      // Older helpers throw on non-2xx instead of honouring\n      // ignoreHttpStatusErrors. Recover the status so 401 and 429 stay visible\n      // to the retry logic rather than surfacing as a generic failure.\n      const response = err && err.response;\n      const status = (err && (err.statusCode || err.httpCode))\n        || (response && (response.statusCode || response.status));\n      if (status) {\n        return wrap(Number(status), (response && response.headers) || {}, _toText(response && response.body));\n      }\n      throw err;\n    }\n  }\n\n  // 3. Raw https module, if the allowlist happens to permit it.\n  let https;\n  try {\n    https = require('https');\n  } catch (e) {\n    throw new Error('NO_HTTP_TRANSPORT: sandbox has no fetch, no this.helpers.httpRequest and no https module');\n  }\n  // Parsed with string ops rather than a regex: escaping a regex through this\n  // template literal is how the previous build silently produced a comment.\n  const withoutScheme = String(url).replace('https://', '').replace('http://', '');\n  const firstSlash = withoutScheme.indexOf('/');\n  const hostPort = firstSlash === -1 ? withoutScheme : withoutScheme.slice(0, firstSlash);\n  const path = firstSlash === -1 ? '/' : withoutScheme.slice(firstSlash);\n  const colon = hostPort.indexOf(':');\n  const hostname = colon === -1 ? hostPort : hostPort.slice(0, colon);\n  const port = colon === -1 ? 443 : Number(hostPort.slice(colon + 1));\n\n  return await new Promise((resolve, reject) => {\n    const req = https.request(\n      { hostname, port, path, method, headers },\n      (res) => {\n        let data = '';\n        res.setEncoding('utf8');\n        res.on('data', (chunk) => { data += chunk; });\n        res.on('end', () => resolve(wrap(res.statusCode, res.headers || {}, data)));\n      },\n    );\n    req.on('error', reject);\n    if (body) req.write(body);\n    req.end();\n  });\n}\n\nconst MCP_URL = 'https://mcp.silpo.ua/mcp';\nconst TOKEN_URL = 'https://mcp.silpo.ua/token';\nconst PROTOCOL_VERSION = '2025-06-18';\n\nfunction createMcp(session) {\n  let accessToken = session.access_token;\n  let refreshed = null;\n  let initialized = false;\n\n  async function refresh() {\n    const res = await httpFetch(TOKEN_URL, {\n      method: 'POST',\n      headers: { 'content-type': 'application/x-www-form-urlencoded' },\n      body: toQuery({\n        grant_type: 'refresh_token',\n        refresh_token: session.refresh_token,\n        client_id: session.client_id,\n        resource: MCP_URL,\n      }),\n    });\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_REAUTH_REQUIRED'); e.code = 'REAUTH'; throw e; }\n    const t = JSON.parse(res.text);\n    accessToken = t.access_token;\n    refreshed = {\n      access_token: t.access_token,\n      refresh_token: t.refresh_token || session.refresh_token,\n      expires_at: new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString(),\n    };\n    return accessToken;\n  }\n\n  async function rpc(method, params) {\n    const id = Math.floor(Math.random() * 1e9);\n    const send = () => httpFetch(MCP_URL, {\n      method: 'POST',\n      headers: {\n        'content-type': 'application/json',\n        accept: 'application/json, text/event-stream',\n        authorization: 'Bearer ' + accessToken,\n        'mcp-protocol-version': PROTOCOL_VERSION,\n      },\n      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),\n    });\n\n    let res = await send();\n    if (res.status === 401) { await refresh(); res = await send(); }\n    for (let i = 0; (res.status === 429 || res.status >= 500) && i < 5; i++) {\n      await sleep(Math.pow(2, i) * 1000 + Math.random() * 250);\n      res = await send();\n    }\n    if (res.status === 403) { const e = new Error('SILPO_FORBIDDEN'); e.code = 'FORBIDDEN'; throw e; }\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_MCP_ERROR_' + res.status); e.code = 'MCP'; throw e; }\n\n    const raw = res.text;\n    let msg;\n    if ((res.headers.get('content-type') || '').includes('text/event-stream')) {\n      for (const line of raw.split('\\n')) {\n        if (!line.startsWith('data:')) continue;\n        try { const m = JSON.parse(line.slice(5).trim()); if (m.id === id || m.error) msg = m; } catch (e) {}\n      }\n    } else { msg = JSON.parse(raw); }\n    if (!msg) throw new Error('SILPO_EMPTY_RESPONSE');\n    if (msg.error) throw new Error('SILPO_RPC_' + msg.error.code);\n    return msg.result;\n  }\n\n  return {\n    async call(name, args) {\n      if (!initialized) {\n        await rpc('initialize', {\n          protocolVersion: PROTOCOL_VERSION,\n          capabilities: {},\n          clientInfo: { name: 'silpo-optimizer-n8n', version: '1.0.0' },\n        });\n        initialized = true;\n      }\n      const result = await rpc('tools/call', { name, arguments: args || {} });\n      const textPart = (result.content || []).find(c => c.type === 'text');\n      let data = result;\n      if (textPart) { try { data = JSON.parse(textPart.text); } catch (e) { data = { raw: textPart.text }; } }\n      if (result.isError) {\n        const detail = typeof data === 'string' ? data : JSON.stringify(data);\n        const e = new Error('TOOL_ERROR_' + name + ': ' + String(detail).slice(0, 300));\n        e.code = 'TOOL';\n        e.detail = data;\n        throw e;\n      }\n      return data;\n    },\n    getRefreshed: () => refreshed,\n  };\n}\n\nasync function mapLimit(items, limit, fn) {\n  const out = new Array(items.length);\n  let cursor = 0;\n  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {\n    while (cursor < items.length) {\n      const i = cursor++;\n      try { out[i] = { ok: true, value: await fn(items[i], i) }; }\n      catch (e) { out[i] = { ok: false, error: e.message }; }\n    }\n  }));\n  return out;\n}\n\n\nconst CYRILLIC_TO_LATIN = {\n  'а':'a','б':'b','в':'v','г':'h','ґ':'g','д':'d','е':'e','є':'ie','ж':'zh','з':'z',\n  'и':'y','і':'i','ї':'i','й':'i','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p',\n  'р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh',\n  'щ':'shch','ь':'','ю':'iu','я':'ia','ы':'y','э':'e','ъ':''\n};\n\nfunction normalizeBrand(value) {\n  const lower = String(value || '').toLowerCase();\n  let out = '';\n  for (const ch of lower) {\n    out += Object.prototype.hasOwnProperty.call(CYRILLIC_TO_LATIN, ch) ? CYRILLIC_TO_LATIN[ch] : ch;\n  }\n  // Latin spellings of the same sounds diverge in predictable ways:\n  //   Асканія/Ascania  -> k vs c      Яготинське/Yagotynske -> h vs g\n  //   премія/PREMIA    -> ii vs i     й/y/j                 -> i\n  // \"ch\" is protected first, otherwise c->k would corrupt Чумак/Chumak.\n  out = out.replace(/[^a-z0-9]/g, '');\n  out = out.split('ch').join('\u0001');\n  out = out.split('c').join('k').split('\u0001').join('ch');\n  out = out.split('g').join('h').split('y').join('i').split('j').join('i');\n  let collapsed = '';\n  for (const ch of out) {\n    if (collapsed.charAt(collapsed.length - 1) !== ch) collapsed += ch;\n  }\n  return collapsed;\n}\n\nfunction brandMatches(a, b) {\n  const left = normalizeBrand(a);\n  const right = normalizeBrand(b);\n  if (!left || !right) return false;\n  if (left === right) return true;\n  // Containment covers multi-word brands (\"Лавка традицій Lago\" vs \"Lago\"), but\n  // only for names long enough that a coincidental substring is unlikely.\n  const shorter = left.length <= right.length ? left : right;\n  const longer = left.length <= right.length ? right : left;\n  return shorter.length >= 4 && longer.indexOf(shorter) !== -1;\n}\n\n/**\n * Optimization engine — the deterministic half.\n *\n * No network calls and no AI: MCP data in, numbers out. Every function is pure\n * so the whole module can be transpiled and inlined into an n8n Code node by\n * `src/workflow/build.ts` — the workflow and the local runs share one source.\n *\n * Prices come exclusively from MCP responses. The model never produces a number.\n */\n/* ------------------------------------------------------------------ sizes */\nconst UNIT_TO_BASE = {\n    'г': ['g', 1],\n    'гр': ['g', 1],\n    'кг': ['g', 1000],\n    'мл': ['ml', 1],\n    'л': ['ml', 1000],\n};\n/** Parses \"112,5г\", \"0,33л\", \"250мл\", \"1кг\" into a base unit (grams or ml). */\nfunction parseSize(text) {\n    if (!text)\n        return null;\n    // No `\\b` after the unit: Cyrillic letters are not word characters in\n    // JavaScript regexes, so a word boundary never matches after \"л\" or \"г\" and\n    // the pattern silently fails on every real value. A negative lookahead for a\n    // following letter does the same job correctly.\n    const match = String(text)\n        .toLowerCase()\n        .replace(',', '.')\n        .match(/(\\d+(?:\\.\\d+)?)\\s*(кг|гр|г|мл|л)(?![а-щьюяїієґa-z])/);\n    if (!match)\n        return null;\n    const entry = UNIT_TO_BASE[match[2]];\n    if (!entry)\n        return null;\n    return { value: parseFloat(match[1]) * entry[1], unit: entry[0] };\n}\n/**\n * Fat or content percentage from a name: \"молоко 2,5%\", \"масло екстра 82%\".\n *\n * Unlike pack size, this is genuinely present in the data — 139 of 288 candidate\n * names carry one — and it separates grades that are otherwise near-identical by\n * name: butter 82% vs 72.5%, sour cream 15% vs 20%.\n */\nfunction parsePercent(text) {\n    if (!text)\n        return null;\n    const match = String(text).replace(',', '.').match(/(\\d+(?:\\.\\d+)?)\\s*%/);\n    return match ? parseFloat(match[1]) : null;\n}\n/** Pack size of a product: the `ratio` field first, then the name as fallback. */\nfunction sizeOf(product) {\n    return parseSize(product.ratio) ?? parseSize(product.name) ?? null;\n}\n/** Price per base unit (UAH per gram or ml), or null when size is unknown. */\nfunction unitPrice(product) {\n    const size = sizeOf(product);\n    if (!size?.value)\n        return null;\n    return product.price / size.value;\n}\n/* -------------------------------------------------------------- similarity */\nconst STOPWORDS = new Set(['з', 'зі', 'та', 'і', 'й', 'у', 'в', 'на', 'для', 'без', 'від', 'до', 'т', 'б', 'шт', 'уп', 'пак', 'ж', 'мдж']);\nfunction tokenize(name) {\n    return String(name)\n        .toLowerCase()\n        .replace(/[«»\"'’,.()\\/\\\\-]/g, ' ')\n        .split(/\\s+/)\n        .filter((t) => t && t.length > 1 && !STOPWORDS.has(t) && !/^\\d+([.,]\\d+)?(г|кг|мл|л|%)?$/.test(t));\n}\n/** Product type — the first meaningful word (\"Напій\", \"Батончик\", \"Сирок\"). */\nfunction headNoun(name) {\n    return tokenize(name)[0] ?? '';\n}\n/** Jaccard overlap of name tokens, 0..1. */\nfunction jaccard(a, b) {\n    const setA = new Set(tokenize(a));\n    const setB = new Set(tokenize(b));\n    if (!setA.size || !setB.size)\n        return 0;\n    let intersection = 0;\n    for (const token of setA)\n        if (setB.has(token))\n            intersection++;\n    return intersection / (setA.size + setB.size - intersection);\n}\n/** Latin tokens as a brand proxy (Alpro, Snickers, Kit Kat) — the API has no brand field. */\nfunction latinTokens(name) {\n    return new Set(String(name).toLowerCase().match(/[a-z][a-z0-9]{2,}/g) ?? []);\n}\n/* ------------------------------------------------------------------ scoring */\n/**\n * Weights are taken verbatim from the brief.\n *\n * The brief also lists `categoryMatchScore`, but leaves it out of the formula —\n * the weights already sum to 1.00 without it. Category is folded into\n * `similarityScore` through the head-noun match instead.\n */\nconst WEIGHTS = {\n    similarity: 0.4,\n    priceSaving: 0.25,\n    brandMatch: 0.1,\n    sizeMatch: 0.1,\n    promotion: 0.1,\n    availability: 0.05,\n};\nfunction round2(n) {\n    return Math.round((n + Number.EPSILON) * 100) / 100;\n}\nfunction scoreCandidate(original, candidate, quantity = 1) {\n    // Similarity: name overlap plus an explicit product-type match.\n    const overlap = jaccard(original.name, candidate.name);\n    const sameHead = headNoun(original.name) === headNoun(candidate.name);\n    const similarityScore = Math.min(1, overlap * 0.7 + (sameHead ? 0.3 : 0));\n    const originalSize = sizeOf(original);\n    const candidateSize = sizeOf(candidate);\n    const sameUnitFamily = Boolean(originalSize && candidateSize && originalSize.unit === candidateSize.unit);\n    const sizeRatio = sameUnitFamily && originalSize && candidateSize ? candidateSize.value / originalSize.value : null;\n    // Unknown size stays neutral: neither rewarded nor punished.\n    const sizeMatchScore = sizeRatio ? Math.max(0, 1 - Math.abs(Math.log2(sizeRatio))) : 0.5;\n    const originalBrand = latinTokens(original.name);\n    const candidateBrand = latinTokens(candidate.name);\n    const sharedBrand = [...originalBrand].some((t) => candidateBrand.has(t));\n    const brandMatchScore = sharedBrand ? 1 : originalBrand.size === 0 && candidateBrand.size === 0 ? 0.5 : 0.2;\n    // Saving is deterministic and sourced from MCP prices only.\n    const savingPerUnit = original.price - candidate.price;\n    const saving = round2(savingPerUnit * quantity);\n    const savingPct = original.price > 0 ? savingPerUnit / original.price : 0;\n    const priceSavingScore = Math.max(0, Math.min(1, savingPct / 0.4)); // -40% saturates\n    const originalUnit = unitPrice(original);\n    const candidateUnit = unitPrice(candidate);\n    const unitSavingPct = originalUnit && candidateUnit ? (originalUnit - candidateUnit) / originalUnit : null;\n    const promotionScore = candidate.oldPrice != null ? 1 : 0;\n    const availabilityScore = candidate.available && (candidate.stock ?? 0) >= quantity ? 1 : 0;\n    // Candidate pack size is unavailable from MCP (see docs/engine-findings.md).\n    // A steep drop within the same product type is the only signal left that the\n    // replacement might simply be a smaller package.\n    const sizeUnknown = !sameUnitFamily;\n    // Identical name, materially lower price. Silpo lists the same product in\n    // several pack sizes under one name — «Сметана Яготинська 15% стакан» is both\n    // 300 g at 57.49 and 180 g at 32.99 — so when the names match exactly, the\n    // difference is almost certainly the pack, not a better deal.\n    const sameName = tokenize(original.name).join(' ') === tokenize(candidate.name).join(' ');\n    const suspiciousDrop = sizeUnknown && (savingPct >= 0.5 || (sameName && savingPct >= 0.15));\n    // The brief is explicit that 2.5% milk must be replaced by 2.5% milk. One\n    // percentage point of slack covers rounding between labels (2.5 vs 2.6) while\n    // still separating grades (82 vs 72.5).\n    const originalPercent = parsePercent(original.name);\n    const candidatePercent = parsePercent(candidate.name);\n    const percentMismatch = originalPercent != null && candidatePercent != null && Math.abs(originalPercent - candidatePercent) > PERCENT_TOLERANCE;\n    const scores = {\n        similarityScore: round2(similarityScore),\n        priceSavingScore: round2(priceSavingScore),\n        brandMatchScore: round2(brandMatchScore),\n        sizeMatchScore: round2(sizeMatchScore),\n        promotionScore,\n        availabilityScore,\n    };\n    const finalScore = similarityScore * WEIGHTS.similarity +\n        priceSavingScore * WEIGHTS.priceSaving +\n        brandMatchScore * WEIGHTS.brandMatch +\n        sizeMatchScore * WEIGHTS.sizeMatch +\n        promotionScore * WEIGHTS.promotion +\n        availabilityScore * WEIGHTS.availability;\n    return {\n        productId: candidate.id,\n        companyId: candidate.companyId,\n        branchId: candidate.branchId,\n        slug: candidate.slug,\n        name: candidate.name,\n        price: candidate.price,\n        oldPrice: candidate.oldPrice ?? null,\n        ratio: candidate.ratio ?? null,\n        stock: candidate.stock ?? 0,\n        available: Boolean(candidate.available),\n        saving,\n        savingPct: round2(savingPct * 100),\n        unitSavingPct: unitSavingPct == null ? null : round2(unitSavingPct * 100),\n        sizeRatio: sizeRatio == null ? null : round2(sizeRatio),\n        sameUnitFamily,\n        sizeUnknown,\n        suspiciousDrop,\n        originalPercent,\n        candidatePercent,\n        percentMismatch,\n        onPromotion: candidate.oldPrice != null,\n        scores,\n        finalScore: round2(finalScore),\n    };\n}\n/* ---------------------------------------------------------------- filtering */\n/** Percentage points of slack allowed between an original and its replacement. */\nconst PERCENT_TOLERANCE = 1;\nconst THRESHOLDS = {\n    /** Below this the candidate is a different kind of product entirely. */\n    minSimilarity: 0.35,\n    minFinalScore: 0.55,\n    /** UAH — smaller gains are not worth bothering the customer with. */\n    minSaving: 1,\n    /**\n     * Pack sizes must be close, not merely within an order of magnitude. At the\n     * old 2x band a 300 g sour cream was replaced by a 180 g one: 4% cheaper per\n     * gram, but 40% less product — two packs would cost more than the original.\n     */\n    minSizeRatio: 0.8,\n    maxSizeRatio: 1.25,\n    minUnitSavingPct: 0,\n};\n/**\n * Drops unsuitable candidates. The governing rule from the brief: preserve what\n * the customer actually intended to buy, rather than find the cheapest thing.\n */\nfunction filterCandidates(original, scored, quantity = 1) {\n    return scored\n        .filter((c) => {\n        // `similar_products` returns the original product itself as a candidate.\n        if (c.productId === original.productId)\n            return false;\n        if (!c.available || c.stock < quantity)\n            return false;\n        // Different fat or content grade — a different product, not a cheaper one.\n        if (c.percentMismatch)\n            return false;\n        if (c.saving < THRESHOLDS.minSaving)\n            return false;\n        if (c.scores.similarityScore < THRESHOLDS.minSimilarity)\n            return false;\n        if (c.finalScore < THRESHOLDS.minFinalScore)\n            return false;\n        // When both sizes are known, the pack must be comparable.\n        if (c.sizeRatio != null && (c.sizeRatio > THRESHOLDS.maxSizeRatio || c.sizeRatio < THRESHOLDS.minSizeRatio)) {\n            return false;\n        }\n        // A saving that comes purely from a smaller pack is not a saving.\n        if (c.unitSavingPct != null && c.unitSavingPct <= THRESHOLDS.minUnitSavingPct)\n            return false;\n        return true;\n    })\n        .sort((a, b) => b.finalScore - a.finalScore);\n}\n/**\n * Builds the plan. Only positive savings are summed.\n * Loyalty bonuses are reported separately and never added to the total.\n */\nfunction buildPlan(cartItems, perItemBest, loyalty) {\n    const replacements = [];\n    for (const { item, best } of perItemBest) {\n        if (!best || best.saving <= 0)\n            continue;\n        replacements.push({\n            originalProductId: item.productId,\n            originalName: item.name,\n            originalPrice: item.price,\n            originalRatio: item.ratio ?? null,\n            quantity: item.quantity,\n            replacementProductId: best.productId,\n            replacementCompanyId: best.companyId,\n            replacementBranchId: best.branchId,\n            replacementName: best.name,\n            replacementPrice: best.price,\n            replacementRatio: best.ratio,\n            onPromotion: best.onPromotion,\n            brand: best.brand ?? null,\n            alternates: best.alternates ?? [],\n            saving: best.saving,\n            savingPct: best.savingPct,\n            finalScore: best.finalScore,\n            scores: best.scores,\n            verifySize: best.suspiciousDrop,\n        });\n    }\n    const originalTotal = round2(cartItems.reduce((sum, item) => sum + item.total, 0));\n    const totalSaving = round2(replacements.reduce((sum, r) => sum + r.saving, 0));\n    return {\n        replacements,\n        summary: {\n            itemsAnalyzed: cartItems.length,\n            replacementsFound: replacements.length,\n            promotionsUsed: replacements.filter((r) => r.onPromotion).length,\n            originalTotal,\n            optimizedTotal: round2(originalTotal - totalSaving),\n            saving: totalSaving,\n            savingPct: originalTotal > 0 ? round2((totalSaving / originalTotal) * 100) : 0,\n            bonusAvailable: loyalty?.bonusAvailable ?? 0,\n        },\n    };\n}\n\nconst input = $('Merge Session').first().json;\nconst mcp = createMcp(input.session);\n\n// Cart: always start from the active cart id, then load the full cart.\nconst { shoppingCartId } = await mcp.call('silpo_get_my_shopping_cart', {});\nconst cartResponse = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId });\nconst cart = cartResponse.cart;\nconst items = cart.shipments.flatMap(s => s.products);\nif (!items.length) {\n  return [{ json: { empty: true, chatId: input.chatId, telegramUserId: input.telegramUserId } }];\n}\nconst branchId = cart.shipments[0].branchId;\nconst deliveryType = cart.deliveryType;\n\n// An expired slot blocks checkout and leaves the promo calls without context.\nlet timeslotStart = cart.timeslot && cart.timeslot.start;\nlet timeslotEnd = cart.timeslot && cart.timeslot.end;\nconst slotExpired = !timeslotStart || new Date(timeslotStart) < new Date()\n  || (cart.calculation.validations || []).some(v => v.level === 'error' && v.type === 'timeslot');\nif (slotExpired) {\n  const { slots } = await mcp.call('silpo_get_time_slots', { branchId, limit: 100 });\n  const fresh = (slots || []).find(s => s.available && s.deliveryType === deliveryType)\n    || (slots || []).find(s => s.available);\n  if (fresh) { timeslotStart = fresh.start; timeslotEnd = fresh.end; }\n}\n\n// Promotions, coupons and loyalty: fetched once per run, in parallel.\nconst contextTasks = [\n  () => mcp.call('silpo_get_promotions', { branchId, deliveryType, timeslotStart, timeslotEnd }),\n  () => mcp.call('silpo_get_my_coupons', {}),\n  () => mcp.call('silpo_get_promo_codes', {}),\n  () => mcp.call('silpo_get_my_promos', {}),\n  () => mcp.call('silpo_get_loyalty_info', {}),\n];\nconst contextResults = await mapLimit(contextTasks, 3, f => f());\nconst promotions = contextResults[0].ok ? contextResults[0].value : null;\nconst coupons = contextResults[1].ok ? contextResults[1].value : null;\n\n// Candidates per cart line; concurrency 3 with backoff inside the client.\nconst lookups = await mapLimit(items, 3, async (item) => {\n  if (!item.slug) return [];\n  const response = await mcp.call('silpo_get_similar_products', { branchId, deliveryType, slug: item.slug, limit: 30 });\n  return response.products || [];\n});\n\n// Out-of-stock lines: one batched replacements call for all of them.\n// An expired slot makes Silpo report stock 0 for every line, so cart stock is\n// only trustworthy while the slot is valid — otherwise this would fan out over\n// the whole cart for nothing.\nconst unavailable = slotExpired ? [] : items.filter(i => i.stock === 0 || i.available === false);\nif (unavailable.length) {\n  try {\n    const replacements = await mcp.call('silpo_get_replacements', {\n      branchId, deliveryType,\n      companyId: unavailable[0].companyId,\n      productIds: unavailable.map(i => i.productId),\n    });\n    if (replacements.products) {\n      items.forEach((item, index) => {\n        if (unavailable.some(u => u.productId === item.productId) && lookups[index].ok) {\n          lookups[index].value = lookups[index].value.concat(replacements.products);\n        }\n      });\n    }\n  } catch (e) { /* replacements are optional */ }\n}\n\n// Deterministic scoring — prices come only from the MCP responses.\n//\n// silpo_get_similar_products reports availability that is out of date:\n// observed available:true / stock:1 for a product that get_product_details and\n// the cart both reported as unavailable. The details call agrees with the cart,\n// so the chosen candidate is re-checked there before it is ever shown, and the\n// next-best one is used when it fails.\nconst CONFIRM_ATTEMPTS = 4;\nconst MAX_OPTIONS = 3;\nconst blockedBrands = (input.blockedBrands || []).filter(Boolean);\n// Cheap pre-filter on the name; the authoritative check is on the attribute.\nconst isBlockedName = name => blockedBrands.some(b => normalizeBrand(name).indexOf(normalizeBrand(b)) !== -1);\n\nconst bestResults = await mapLimit(items, 3, async (item, i) => {\n  const candidates = lookups[i] && lookups[i].ok ? lookups[i].value : [];\n  const ranked = candidates\n    .map(raw => ({ raw, scored: scoreCandidate(item, raw, item.quantity) }))\n    .filter(x => filterCandidates(item, [x.scored], item.quantity).length > 0)\n    // Cheap pass first: drop obvious matches before spending a details call.\n    .filter(x => !isBlockedName(x.raw.name))\n    .sort((a, b) => b.scored.finalScore - a.scored.finalScore);\n\n  const confirmedOptions = [];\n  for (const candidate of ranked.slice(0, CONFIRM_ATTEMPTS)) {\n    let details;\n    try {\n      details = await mcp.call('silpo_get_product_details', {\n        branchId, deliveryType, timeslotStart, timeslotEnd, slug: candidate.raw.slug,\n      });\n    } catch (e) {\n      continue; // cannot confirm - do not risk it\n    }\n    const product = details.product || {};\n    if (product.available === false || (product.stock || 0) < item.quantity) continue;\n\n    // The authoritative brand: names do not always carry it (\"Простонаше\" vs\n    // \"ПростоНаше\", \"Ascania\" vs \"Асканія\"), the attribute does.\n    const brand = (product.attributes || {})['Торгова марка'] || null;\n    if (brand && blockedBrands.some(b => brandMatches(brand, b))) continue;\n\n    // Details also carries the fresher price, so the saving is recomputed\n    // against it rather than against the stale search result.\n    const confirmedRaw = Object.assign({}, candidate.raw, {\n      price: product.price != null ? product.price : candidate.raw.price,\n      oldPrice: product.oldPrice != null ? product.oldPrice : candidate.raw.oldPrice,\n      stock: product.stock,\n      available: true,\n    });\n    const rescored = scoreCandidate(item, confirmedRaw, item.quantity);\n    if (!filterCandidates(item, [rescored], item.quantity).length) continue;\n    rescored.brand = brand;\n    // Keep the runners-up: pack size only becomes visible once an item is in\n    // the cart, so the apply step needs something to fall back to.\n    confirmedOptions.push(rescored);\n    if (confirmedOptions.length >= MAX_OPTIONS) break;\n  }\n  if (!confirmedOptions.length) return null;\n\n  // A candidate flagged verifySize is one the semantic layer will refuse, so\n  // leading with it costs the line its replacement entirely even when a clean\n  // alternative sits right behind. Safe options first, score second; the\n  // suspicious one stays available as a last-resort alternate.\n  confirmedOptions.sort((a, b) =>\n    (a.suspiciousDrop ? 1 : 0) - (b.suspiciousDrop ? 1 : 0) || b.finalScore - a.finalScore);\n\n  const best = confirmedOptions[0];\n  best.alternates = confirmedOptions.slice(1).map(c => ({\n    productId: c.productId,\n    companyId: c.companyId,\n    branchId: c.branchId,\n    name: c.name,\n    price: c.price,\n    saving: c.saving,\n    brand: c.brand || null,\n  }));\n  return best;\n});\n\nconst perItemBest = items.map((item, i) => ({\n  item,\n  best: bestResults[i] && bestResults[i].ok ? bestResults[i].value : null,\n}));\n\nconst plan = buildPlan(items, perItemBest, cartResponse.loyalty || {});\n\nreturn [{ json: {\n  chatId: input.chatId,\n  telegramUserId: input.telegramUserId,\n  shoppingCartId, branchId, deliveryType, timeslotStart, timeslotEnd,\n  cartTotal: cart.calculation.total,\n  slotExpired,\n  loyalty: cartResponse.loyalty || {},\n  promotionsCount: ((promotions && promotions.promotions) || []).length,\n  couponsCount: ((coupons && coupons.coupons) || []).length,\n  refreshedTokens: mcp.getRefreshed(),\n  ...plan,\n} }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "optimize-cart",
+      "name": "Optimize Cart",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        -80
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// The prompt is Ukrainian on purpose: product names and the reasons shown to\n// the customer are Ukrainian, so the model should reason in the same language.\nconst SYSTEM_PROMPT = `Ти — асистент, який перевіряє заміни товарів у кошику супермаркету «Сільпо».\n\nТВОЯ ЄДИНА ЗАДАЧА: вирішити, чи зберігає запропонована заміна СУТЬ покупки.\n\nПРИЙМАЙ, якщо товар виконує ту саму роль:\n- молоко 2.5% -> інше молоко 2.5%\n- макарони -> макарони іншого бренду\n- куряче філе -> куряче філе\n\nВІДХИЛЯЙ, якщо змінюється призначення товару:\n- протеїновий/спортивний -> звичайний солодкий\n- молоко -> рослинний напій (і навпаки)\n- комбуча -> звичайний сік або газованка\n- безлактозний/безглютеновий -> звичайний (дієтичне обмеження)\n- дитяче харчування -> недитяче\n- без цукру -> із цукром\n\nОСОБЛИВА УВАГА: дані «Сільпо» НЕ містять об'єму кандидатів. Якщо ціна падає\nбільш ніж на 50%, це може бути менша упаковка. Тоді confidence не вище 0.6\nі згадай про перевірку об'єму в reason.\n\nВІДПОВІДАЙ ВИКЛЮЧНО JSON, без markdown:\n{\"decisions\":[{\"index\":0,\"accept\":true,\"confidence\":0.85,\"reason\":\"...\"}]}\nreason — українською, до 90 символів.`;\n\nconst plan = $json;\nconst lines = (plan.replacements || []).map((r, i) =>\n  '[' + i + '] було: ' + r.originalName + (r.originalRatio ? ' (' + r.originalRatio + ')' : '')\n  + ' | стане: ' + r.replacementName\n  + ' | падіння ціни: ' + r.savingPct + '%' + (r.verifySize ? ' ПІДОЗРІЛО ВЕЛИКЕ' : '')\n  + (r.onPromotion ? ' | за акцією' : ''));\n\nreturn [{ json: { ...plan,\n  aiSystemPrompt: SYSTEM_PROMPT,\n  aiUserPrompt: 'Перевір ці ' + lines.length + ' замін.\\n\\n' + lines.join('\\n'),\n}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "build-ai-prompt",
+      "name": "Build AI Prompt",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n/**\n * Optimization engine — the deterministic half.\n *\n * No network calls and no AI: MCP data in, numbers out. Every function is pure\n * so the whole module can be transpiled and inlined into an n8n Code node by\n * `src/workflow/build.ts` — the workflow and the local runs share one source.\n *\n * Prices come exclusively from MCP responses. The model never produces a number.\n */\n/* ------------------------------------------------------------------ sizes */\nconst UNIT_TO_BASE = {\n    'г': ['g', 1],\n    'гр': ['g', 1],\n    'кг': ['g', 1000],\n    'мл': ['ml', 1],\n    'л': ['ml', 1000],\n};\n/** Parses \"112,5г\", \"0,33л\", \"250мл\", \"1кг\" into a base unit (grams or ml). */\nfunction parseSize(text) {\n    if (!text)\n        return null;\n    // No `\\b` after the unit: Cyrillic letters are not word characters in\n    // JavaScript regexes, so a word boundary never matches after \"л\" or \"г\" and\n    // the pattern silently fails on every real value. A negative lookahead for a\n    // following letter does the same job correctly.\n    const match = String(text)\n        .toLowerCase()\n        .replace(',', '.')\n        .match(/(\\d+(?:\\.\\d+)?)\\s*(кг|гр|г|мл|л)(?![а-щьюяїієґa-z])/);\n    if (!match)\n        return null;\n    const entry = UNIT_TO_BASE[match[2]];\n    if (!entry)\n        return null;\n    return { value: parseFloat(match[1]) * entry[1], unit: entry[0] };\n}\n/**\n * Fat or content percentage from a name: \"молоко 2,5%\", \"масло екстра 82%\".\n *\n * Unlike pack size, this is genuinely present in the data — 139 of 288 candidate\n * names carry one — and it separates grades that are otherwise near-identical by\n * name: butter 82% vs 72.5%, sour cream 15% vs 20%.\n */\nfunction parsePercent(text) {\n    if (!text)\n        return null;\n    const match = String(text).replace(',', '.').match(/(\\d+(?:\\.\\d+)?)\\s*%/);\n    return match ? parseFloat(match[1]) : null;\n}\n/** Pack size of a product: the `ratio` field first, then the name as fallback. */\nfunction sizeOf(product) {\n    return parseSize(product.ratio) ?? parseSize(product.name) ?? null;\n}\n/** Price per base unit (UAH per gram or ml), or null when size is unknown. */\nfunction unitPrice(product) {\n    const size = sizeOf(product);\n    if (!size?.value)\n        return null;\n    return product.price / size.value;\n}\n/* -------------------------------------------------------------- similarity */\nconst STOPWORDS = new Set(['з', 'зі', 'та', 'і', 'й', 'у', 'в', 'на', 'для', 'без', 'від', 'до', 'т', 'б', 'шт', 'уп', 'пак', 'ж', 'мдж']);\nfunction tokenize(name) {\n    return String(name)\n        .toLowerCase()\n        .replace(/[«»\"'’,.()\\/\\\\-]/g, ' ')\n        .split(/\\s+/)\n        .filter((t) => t && t.length > 1 && !STOPWORDS.has(t) && !/^\\d+([.,]\\d+)?(г|кг|мл|л|%)?$/.test(t));\n}\n/** Product type — the first meaningful word (\"Напій\", \"Батончик\", \"Сирок\"). */\nfunction headNoun(name) {\n    return tokenize(name)[0] ?? '';\n}\n/** Jaccard overlap of name tokens, 0..1. */\nfunction jaccard(a, b) {\n    const setA = new Set(tokenize(a));\n    const setB = new Set(tokenize(b));\n    if (!setA.size || !setB.size)\n        return 0;\n    let intersection = 0;\n    for (const token of setA)\n        if (setB.has(token))\n            intersection++;\n    return intersection / (setA.size + setB.size - intersection);\n}\n/** Latin tokens as a brand proxy (Alpro, Snickers, Kit Kat) — the API has no brand field. */\nfunction latinTokens(name) {\n    return new Set(String(name).toLowerCase().match(/[a-z][a-z0-9]{2,}/g) ?? []);\n}\n/* ------------------------------------------------------------------ scoring */\n/**\n * Weights are taken verbatim from the brief.\n *\n * The brief also lists `categoryMatchScore`, but leaves it out of the formula —\n * the weights already sum to 1.00 without it. Category is folded into\n * `similarityScore` through the head-noun match instead.\n */\nconst WEIGHTS = {\n    similarity: 0.4,\n    priceSaving: 0.25,\n    brandMatch: 0.1,\n    sizeMatch: 0.1,\n    promotion: 0.1,\n    availability: 0.05,\n};\nfunction round2(n) {\n    return Math.round((n + Number.EPSILON) * 100) / 100;\n}\nfunction scoreCandidate(original, candidate, quantity = 1) {\n    // Similarity: name overlap plus an explicit product-type match.\n    const overlap = jaccard(original.name, candidate.name);\n    const sameHead = headNoun(original.name) === headNoun(candidate.name);\n    const similarityScore = Math.min(1, overlap * 0.7 + (sameHead ? 0.3 : 0));\n    const originalSize = sizeOf(original);\n    const candidateSize = sizeOf(candidate);\n    const sameUnitFamily = Boolean(originalSize && candidateSize && originalSize.unit === candidateSize.unit);\n    const sizeRatio = sameUnitFamily && originalSize && candidateSize ? candidateSize.value / originalSize.value : null;\n    // Unknown size stays neutral: neither rewarded nor punished.\n    const sizeMatchScore = sizeRatio ? Math.max(0, 1 - Math.abs(Math.log2(sizeRatio))) : 0.5;\n    const originalBrand = latinTokens(original.name);\n    const candidateBrand = latinTokens(candidate.name);\n    const sharedBrand = [...originalBrand].some((t) => candidateBrand.has(t));\n    const brandMatchScore = sharedBrand ? 1 : originalBrand.size === 0 && candidateBrand.size === 0 ? 0.5 : 0.2;\n    // Saving is deterministic and sourced from MCP prices only.\n    const savingPerUnit = original.price - candidate.price;\n    const saving = round2(savingPerUnit * quantity);\n    const savingPct = original.price > 0 ? savingPerUnit / original.price : 0;\n    const priceSavingScore = Math.max(0, Math.min(1, savingPct / 0.4)); // -40% saturates\n    const originalUnit = unitPrice(original);\n    const candidateUnit = unitPrice(candidate);\n    const unitSavingPct = originalUnit && candidateUnit ? (originalUnit - candidateUnit) / originalUnit : null;\n    const promotionScore = candidate.oldPrice != null ? 1 : 0;\n    const availabilityScore = candidate.available && (candidate.stock ?? 0) >= quantity ? 1 : 0;\n    // Candidate pack size is unavailable from MCP (see docs/engine-findings.md).\n    // A steep drop within the same product type is the only signal left that the\n    // replacement might simply be a smaller package.\n    const sizeUnknown = !sameUnitFamily;\n    // Identical name, materially lower price. Silpo lists the same product in\n    // several pack sizes under one name — «Сметана Яготинська 15% стакан» is both\n    // 300 g at 57.49 and 180 g at 32.99 — so when the names match exactly, the\n    // difference is almost certainly the pack, not a better deal.\n    const sameName = tokenize(original.name).join(' ') === tokenize(candidate.name).join(' ');\n    const suspiciousDrop = sizeUnknown && (savingPct >= 0.5 || (sameName && savingPct >= 0.15));\n    // The brief is explicit that 2.5% milk must be replaced by 2.5% milk. One\n    // percentage point of slack covers rounding between labels (2.5 vs 2.6) while\n    // still separating grades (82 vs 72.5).\n    const originalPercent = parsePercent(original.name);\n    const candidatePercent = parsePercent(candidate.name);\n    const percentMismatch = originalPercent != null && candidatePercent != null && Math.abs(originalPercent - candidatePercent) > PERCENT_TOLERANCE;\n    const scores = {\n        similarityScore: round2(similarityScore),\n        priceSavingScore: round2(priceSavingScore),\n        brandMatchScore: round2(brandMatchScore),\n        sizeMatchScore: round2(sizeMatchScore),\n        promotionScore,\n        availabilityScore,\n    };\n    const finalScore = similarityScore * WEIGHTS.similarity +\n        priceSavingScore * WEIGHTS.priceSaving +\n        brandMatchScore * WEIGHTS.brandMatch +\n        sizeMatchScore * WEIGHTS.sizeMatch +\n        promotionScore * WEIGHTS.promotion +\n        availabilityScore * WEIGHTS.availability;\n    return {\n        productId: candidate.id,\n        companyId: candidate.companyId,\n        branchId: candidate.branchId,\n        slug: candidate.slug,\n        name: candidate.name,\n        price: candidate.price,\n        oldPrice: candidate.oldPrice ?? null,\n        ratio: candidate.ratio ?? null,\n        stock: candidate.stock ?? 0,\n        available: Boolean(candidate.available),\n        saving,\n        savingPct: round2(savingPct * 100),\n        unitSavingPct: unitSavingPct == null ? null : round2(unitSavingPct * 100),\n        sizeRatio: sizeRatio == null ? null : round2(sizeRatio),\n        sameUnitFamily,\n        sizeUnknown,\n        suspiciousDrop,\n        originalPercent,\n        candidatePercent,\n        percentMismatch,\n        onPromotion: candidate.oldPrice != null,\n        scores,\n        finalScore: round2(finalScore),\n    };\n}\n/* ---------------------------------------------------------------- filtering */\n/** Percentage points of slack allowed between an original and its replacement. */\nconst PERCENT_TOLERANCE = 1;\nconst THRESHOLDS = {\n    /** Below this the candidate is a different kind of product entirely. */\n    minSimilarity: 0.35,\n    minFinalScore: 0.55,\n    /** UAH — smaller gains are not worth bothering the customer with. */\n    minSaving: 1,\n    /**\n     * Pack sizes must be close, not merely within an order of magnitude. At the\n     * old 2x band a 300 g sour cream was replaced by a 180 g one: 4% cheaper per\n     * gram, but 40% less product — two packs would cost more than the original.\n     */\n    minSizeRatio: 0.8,\n    maxSizeRatio: 1.25,\n    minUnitSavingPct: 0,\n};\n/**\n * Drops unsuitable candidates. The governing rule from the brief: preserve what\n * the customer actually intended to buy, rather than find the cheapest thing.\n */\nfunction filterCandidates(original, scored, quantity = 1) {\n    return scored\n        .filter((c) => {\n        // `similar_products` returns the original product itself as a candidate.\n        if (c.productId === original.productId)\n            return false;\n        if (!c.available || c.stock < quantity)\n            return false;\n        // Different fat or content grade — a different product, not a cheaper one.\n        if (c.percentMismatch)\n            return false;\n        if (c.saving < THRESHOLDS.minSaving)\n            return false;\n        if (c.scores.similarityScore < THRESHOLDS.minSimilarity)\n            return false;\n        if (c.finalScore < THRESHOLDS.minFinalScore)\n            return false;\n        // When both sizes are known, the pack must be comparable.\n        if (c.sizeRatio != null && (c.sizeRatio > THRESHOLDS.maxSizeRatio || c.sizeRatio < THRESHOLDS.minSizeRatio)) {\n            return false;\n        }\n        // A saving that comes purely from a smaller pack is not a saving.\n        if (c.unitSavingPct != null && c.unitSavingPct <= THRESHOLDS.minUnitSavingPct)\n            return false;\n        return true;\n    })\n        .sort((a, b) => b.finalScore - a.finalScore);\n}\n/**\n * Builds the plan. Only positive savings are summed.\n * Loyalty bonuses are reported separately and never added to the total.\n */\nfunction buildPlan(cartItems, perItemBest, loyalty) {\n    const replacements = [];\n    for (const { item, best } of perItemBest) {\n        if (!best || best.saving <= 0)\n            continue;\n        replacements.push({\n            originalProductId: item.productId,\n            originalName: item.name,\n            originalPrice: item.price,\n            originalRatio: item.ratio ?? null,\n            quantity: item.quantity,\n            replacementProductId: best.productId,\n            replacementCompanyId: best.companyId,\n            replacementBranchId: best.branchId,\n            replacementName: best.name,\n            replacementPrice: best.price,\n            replacementRatio: best.ratio,\n            onPromotion: best.onPromotion,\n            brand: best.brand ?? null,\n            alternates: best.alternates ?? [],\n            saving: best.saving,\n            savingPct: best.savingPct,\n            finalScore: best.finalScore,\n            scores: best.scores,\n            verifySize: best.suspiciousDrop,\n        });\n    }\n    const originalTotal = round2(cartItems.reduce((sum, item) => sum + item.total, 0));\n    const totalSaving = round2(replacements.reduce((sum, r) => sum + r.saving, 0));\n    return {\n        replacements,\n        summary: {\n            itemsAnalyzed: cartItems.length,\n            replacementsFound: replacements.length,\n            promotionsUsed: replacements.filter((r) => r.onPromotion).length,\n            originalTotal,\n            optimizedTotal: round2(originalTotal - totalSaving),\n            saving: totalSaving,\n            savingPct: originalTotal > 0 ? round2((totalSaving / originalTotal) * 100) : 0,\n            bonusAvailable: loyalty?.bonusAvailable ?? 0,\n        },\n    };\n}\n// The model only decides accept/reject. Every total below is recomputed here,\n// so a hallucinated number can never reach the customer.\nconst plan = $('Build AI Prompt').first().json;\nconst replacements = plan.replacements || [];\n\n// Rule-based fallback for a missing key, an API error or malformed output.\nfunction fallback(list) {\n  const RED_FLAGS = [\n    [/протеїн|protein|nutri|profeel/i, 'оригінал — протеїновий продукт'],\n    [/безлактозн/i, 'оригінал — безлактозний'],\n    [/без цукру|безглютен|без глютен/i, 'оригінал має дієтичне обмеження'],\n    [/комбуч/i, 'оригінал — ферментований напій'],\n    [/дитяч|milupa/i, 'оригінал — дитяче харчування'],\n  ];\n  return list.map((r, index) => {\n    let blocker = null;\n    for (const [pattern, label] of RED_FLAGS) {\n      if (pattern.test(r.originalName) && !pattern.test(r.replacementName)) { blocker = label; break; }\n    }\n    const accept = !blocker && r.finalScore >= 0.6 && !r.verifySize;\n    return { index, accept,\n      confidence: accept ? Math.min(0.75, r.finalScore) : 0.3,\n      reason: accept ? 'Схожий товар тієї ж категорії' + (r.onPromotion ? ', за акцією' : '')\n        : (blocker || (r.verifySize ? 'Підозріло велике падіння ціни — можлива менша упаковка' : 'Недостатня схожість')),\n      source: 'fallback' };\n  });\n}\n\nlet decisions = null;\ntry {\n  const response = $input.first().json;\n  const textPart = (response.content || []).find(c => c.type === 'text');\n  if (textPart) {\n    const parsed = JSON.parse(String(textPart.text).replace(/^\\`\\`\\`(?:json)?|\\`\\`\\`$/g, '').trim());\n    const byIndex = new Map((parsed.decisions || []).map(d => [d.index, d]));\n    decisions = replacements.map((r, i) => {\n      const decision = byIndex.get(i);\n      if (!decision) return fallback([r])[0];\n      return { index: i, accept: Boolean(decision.accept),\n        confidence: Math.max(0, Math.min(1, Number(decision.confidence) || 0)),\n        reason: String(decision.reason || '').slice(0, 120), source: 'ai' };\n    });\n  }\n} catch (e) { decisions = null; }\nif (!decisions) decisions = fallback(replacements);\n\nconst kept = [], rejected = [];\nreplacements.forEach((r, i) => {\n  const decision = decisions[i];\n  const enriched = { ...r, aiReason: decision.reason, aiConfidence: decision.confidence, aiSource: decision.source };\n  (decision.accept && decision.confidence >= 0.5 ? kept : rejected).push(enriched);\n});\n\nconst saving = round2(kept.reduce((sum, r) => sum + r.saving, 0));\nconst originalTotal = plan.summary.originalTotal;\n\nconst summary = { ...plan.summary,\n  replacementsFound: kept.length,\n  promotionsUsed: kept.filter(r => r.onPromotion).length,\n  optimizedTotal: round2(originalTotal - saving),\n  saving,\n  savingPct: originalTotal > 0 ? round2(saving / originalTotal * 100) : 0,\n};\n\n// Only what the apply step actually needs is persisted — scores and diagnostics\n// stay in memory. Keeps the stored row small and leaks less into storage.\nconst stored = {\n  shoppingCartId: plan.shoppingCartId,\n  // Indices the guest wants applied; everything is selected by default.\n  selected: kept.map((r, i) => i),\n  replacements: kept.map(r => ({\n    originalProductId: r.originalProductId,\n    originalName: r.originalName,\n    originalPrice: r.originalPrice,\n    quantity: r.quantity,\n    replacementProductId: r.replacementProductId,\n    replacementCompanyId: r.replacementCompanyId,\n    replacementBranchId: r.replacementBranchId,\n    replacementName: r.replacementName,\n    replacementPrice: r.replacementPrice,\n    alternates: r.alternates || [],\n    saving: r.saving,\n    savingPct: r.savingPct,\n    onPromotion: r.onPromotion,\n    verifySize: r.verifySize,\n    aiReason: r.aiReason,\n  })),\n  summary: { originalTotal, saving },\n};\n\n// Telegram caps callback_data at 64 bytes, and a toggle carries plan id plus an\n// index. A cartId+timestamp key ate 50 of those, so the plan gets a short key of\n// its own — nothing downstream derives meaning from it.\nconst shortId = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4);\n\nreturn [{ json: { ...plan,\n  planId: shortId,\n  replacements: kept,\n  rejectedByAI: rejected,\n  aiSource: decisions[0] ? decisions[0].source : 'none',\n  storedPlan: JSON.stringify(stored),\n  summary,\n}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "apply-ai-decisions",
+      "name": "Apply AI Decisions",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1620,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "plan_id": "={{ $json.planId }}",
+            "telegram_user_id": "={{ $json.telegramUserId }}",
+            "cart_id": "={{ $json.shoppingCartId }}",
+            "plan_json": "={{ $json.storedPlan }}",
+            "original_total": "={{ $json.summary.originalTotal }}",
+            "status": "pending"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "plan_id",
+              "displayName": "plan_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cart_id",
+              "displayName": "cart_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "plan_json",
+              "displayName": "plan_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_total",
+              "displayName": "original_total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "save-plan",
+      "name": "Save Plan",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1840,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nfunction readVar(name) {\n  try {\n    return (typeof $vars !== 'undefined' && $vars[name]) || null;\n  } catch (e) {\n    return null;\n  }\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\nconst plan = $('Apply AI Decisions').first().json;\n// Everything is selected to begin with; the guest unticks what they do not want.\nconst selected = (plan.replacements || []).map((r, i) => i);\nconst card = buildSelectionCard(plan, selected);\n\nconst body = { chat_id: plan.chatId, text: card.text, parse_mode: 'Markdown' };\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: { url: telegramApiUrl('sendMessage'), body } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "format-recommendation",
+      "name": "Format Recommendation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2060,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "send-recommendation",
+      "name": "Send Recommendation",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2280,
+        -240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst CYRILLIC_TO_LATIN = {\n  'а':'a','б':'b','в':'v','г':'h','ґ':'g','д':'d','е':'e','є':'ie','ж':'zh','з':'z',\n  'и':'y','і':'i','ї':'i','й':'i','к':'k','л':'l','м':'m','н':'n','о':'o','п':'p',\n  'р':'r','с':'s','т':'t','у':'u','ф':'f','х':'h','ц':'ts','ч':'ch','ш':'sh',\n  'щ':'shch','ь':'','ю':'iu','я':'ia','ы':'y','э':'e','ъ':''\n};\n\nfunction normalizeBrand(value) {\n  const lower = String(value || '').toLowerCase();\n  let out = '';\n  for (const ch of lower) {\n    out += Object.prototype.hasOwnProperty.call(CYRILLIC_TO_LATIN, ch) ? CYRILLIC_TO_LATIN[ch] : ch;\n  }\n  // Latin spellings of the same sounds diverge in predictable ways:\n  //   Асканія/Ascania  -> k vs c      Яготинське/Yagotynske -> h vs g\n  //   премія/PREMIA    -> ii vs i     й/y/j                 -> i\n  // \"ch\" is protected first, otherwise c->k would corrupt Чумак/Chumak.\n  out = out.replace(/[^a-z0-9]/g, '');\n  out = out.split('ch').join('\u0001');\n  out = out.split('c').join('k').split('\u0001').join('ch');\n  out = out.split('g').join('h').split('y').join('i').split('j').join('i');\n  let collapsed = '';\n  for (const ch of out) {\n    if (collapsed.charAt(collapsed.length - 1) !== ch) collapsed += ch;\n  }\n  return collapsed;\n}\n\nfunction brandMatches(a, b) {\n  const left = normalizeBrand(a);\n  const right = normalizeBrand(b);\n  if (!left || !right) return false;\n  if (left === right) return true;\n  // Containment covers multi-word brands (\"Лавка традицій Lago\" vs \"Lago\"), but\n  // only for names long enough that a coincidental substring is unlikely.\n  const shorter = left.length <= right.length ? left : right;\n  const longer = left.length <= right.length ? right : left;\n  return shorter.length >= 4 && longer.indexOf(shorter) !== -1;\n}\n\n// Brands the guest never wants offered. Stored pipe-separated on their session\n// row, matched case-insensitively against both the product name and the\n// \"Торгова марка\" attribute that get_product_details returns.\nconst route = $('Merge Session').first().json;\nconst current = route.blockedBrands || [];\nconst brand = (route.brandArg || '').trim();\nconst lower = brand.toLowerCase();\n\nlet next = current.slice();\nlet text;\n\nif (route.action === 'block') {\n  if (!brand) {\n    text = '🚫 *Не пропонувати марку*\\n\\nНапишіть команду разом із назвою марки — вона вказана під кожною заміною в картці оптимізації.\\n\\nНаприклад: `/block` і далі назва.';\n  } else if (current.some(b => brandMatches(b, brand))) {\n    text = '🚫 «' + brand + '» вже у чорному списку.';\n  } else {\n    next = current.concat([brand]);\n    text = '🚫 «' + brand + '» додано.\\n\\n_Більше не пропонуватиму цю марку як заміну._';\n  }\n} else if (route.action === 'unblock') {\n  if (!brand) {\n    text = 'Напишіть `/unblock` і назву марки, яку хочете повернути.\\n\\nПоточний список — /blocked';\n  } else {\n    next = current.filter(b => !brandMatches(b, brand));\n    text = next.length === current.length\n      ? '«' + brand + '» не було у списку.'\n      : '✅ «' + brand + '» прибрано з чорного списку.';\n  }\n} else {\n  text = current.length\n    ? '🚫 *Ці марки я не пропоную*\\n\\n' + current.map(b => '• ' + b).join('\\n')\n      + '\\n\\n_Повернути:_ `/unblock` і назва марки'\n    : '🚫 *Список винятків порожній*\\n\\nЯ пропоную заміни будь-яких марок.\\n\\nЩоб виключити якусь, напишіть `/block` і назву марки — вона вказана під кожною заміною в картці оптимізації.';\n}\n\nreturn [{ json: {\n  chatId: route.chatId,\n  telegramUserId: route.telegramUserId,\n  blockedValue: next.join('|'),\n  text,\n}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "update-blocklist",
+      "name": "Update Blocklist",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_SESSIONS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "silpo_sessions"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "telegram_user_id",
+              "keyValue": "={{ $json.telegramUserId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "blocked_brands": "={{ $json.blockedValue }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "client_id",
+              "displayName": "client_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "access_token_enc",
+              "displayName": "access_token_enc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "expires_at",
+              "displayName": "expires_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "refresh_token_enc",
+              "displayName": "refresh_token_enc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "blocked_brands",
+              "displayName": "blocked_brands",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "save-blocklist",
+      "name": "Save Blocklist",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        740,
+        1280
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Update Blocklist').first().json.chatId }}",
+        "text": "={{ $('Update Blocklist').first().json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-blocklist",
+      "name": "Send Blocklist",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        1280
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.planId }}"
+            }
+          ]
+        }
+      },
+      "id": "load-plan-for-toggle",
+      "name": "Load Plan For Toggle",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        1120
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nfunction readVar(name) {\n  try {\n    return (typeof $vars !== 'undefined' && $vars[name]) || null;\n  } catch (e) {\n    return null;\n  }\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\nconst route = $('Merge Session').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);\nconst row = rows.find(r => String(r.plan_id) === String(route.planId));\n\n// Same ownership boundary as everywhere else a plan is touched.\nif (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {\n  return [{ json: { skip: true, url: telegramApiUrl('answerCallbackQuery'), body: {\n    callback_query_id: route.callbackQueryId,\n    text: 'План застарів — запустіть /optimize ще раз',\n  }}}];\n}\n\nconst plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;\nplan.planId = row.plan_id;\nconst selected = Array.isArray(plan.selected) ? plan.selected.slice() : (plan.replacements || []).map((r, i) => i);\n\nconst index = Number(route.toggleIndex);\nconst at = selected.indexOf(index);\nif (at === -1) selected.push(index); else selected.splice(at, 1);\nselected.sort((a, b) => a - b);\nplan.selected = selected;\n\nconst card = buildSelectionCard(plan, selected);\nconst body = {\n  chat_id: route.chatId,\n  message_id: route.messageId,\n  text: card.text,\n  parse_mode: 'Markdown',\n};\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: {\n  skip: false,\n  planId: row.plan_id,\n  planJson: JSON.stringify(plan),\n  url: telegramApiUrl('editMessageText'),\n  body,\n}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "toggle-selection",
+      "name": "Toggle Selection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        1120
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.planId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "plan_json": "={{ $json.planJson }}"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "plan_id",
+              "displayName": "plan_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cart_id",
+              "displayName": "cart_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "plan_json",
+              "displayName": "plan_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_total",
+              "displayName": "original_total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "save-selection",
+      "name": "Save Selection",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        1120
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $('Toggle Selection').first().json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Toggle Selection').first().json.body) }}",
+        "options": {}
+      },
+      "id": "update-card",
+      "name": "Update Card",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1180,
+        1120
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.planId }}"
+            }
+          ]
+        }
+      },
+      "id": "load-plan",
+      "name": "Load Plan",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        320
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Data Table filters only do equality, so ownership, status and age are checked\n// here. Ownership is a security boundary: a leaked plan id must not be enough to\n// modify somebody else's cart.\nconst PLAN_TTL_MINUTES = 30;\nconst route = $('Merge Session').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);\nconst row = rows.find(r => String(r.plan_id) === String(route.planId));\n\nconst reject = (text) => [{ json: { chatId: route.chatId, invalid: true, text } }];\n\nif (!row) return reject('⏳ План не знайдено. Запустіть /optimize ще раз.');\nif (String(row.telegram_user_id) !== String(route.telegramUserId)) {\n  return reject('⛔ Цей план належить іншому користувачу.');\n}\nif (row.status === 'applying') {\n  return reject('⏳ Ці зміни вже застосовуються — зачекайте кілька секунд.\\n\\nНе тисніть кнопку повторно, інакше заміни зробляться двічі.');\n}\nif (row.status !== 'pending') {\n  return reject('✅ Цей план уже застосований або скасований.\\n\\nЗапустіть /optimize, щоб порахувати заново.');\n}\nconst createdAt = new Date(row.createdAt || row.created_at || 0);\nif (Date.now() - createdAt.getTime() > PLAN_TTL_MINUTES * 60 * 1000) {\n  return reject('⏳ План застарів — ціни могли змінитися.\\n\\nЗапустіть /optimize ще раз.');\n}\n\nreturn [{ json: { ...row, invalid: false } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "validate-plan",
+      "name": "Validate Plan",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        630,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\n\n// The Code-node sandbox is a restricted VM, not Node: there is no fetch, no URL\n// and no URLSearchParams, and require() is limited to an allowlist - 'crypto'\n// loads, 'url' and 'buffer' are rejected outright.\n//\n// Buffer is therefore taken from a real Buffer instance produced by crypto,\n// which needs no module and no global.\nconst Buf = require('crypto').randomBytes(0).constructor;\n\n// The node context is bound to 'this' only at the top level of a Code node;\n// inside a plain function call it is undefined. Capture the helper here.\nconst _nodeHelpers = (function () {\n  try {\n    return this && this.helpers ? this.helpers : null;\n  } catch (e) {\n    return null;\n  }\n}).call(this);\n\nfunction _toText(raw) {\n  if (raw === undefined || raw === null) return '';\n  if (typeof raw === 'string') return raw;\n  if (raw.constructor === Buf) return raw.toString('utf8');\n  if (raw.type === 'Buffer' && Array.isArray(raw.data)) return Buf.from(raw.data).toString('utf8');\n  return JSON.stringify(raw);\n}\n\nfunction sleep(ms) {\n  if (typeof setTimeout !== 'function') return Promise.resolve();\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}\n\nfunction toQuery(params) {\n  return Object.keys(params)\n    .filter((k) => params[k] !== undefined && params[k] !== null)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n}\n\nasync function httpFetch(url, opts) {\n  const method = (opts && opts.method) || 'GET';\n  const headers = (opts && opts.headers) || {};\n  const body = opts && opts.body;\n  const wrap = (status, headerObj, text) => ({\n    status,\n    text,\n    headers: { get: (n) => headerObj[String(n).toLowerCase()] },\n  });\n\n  // 1. Native fetch, when the runtime provides it.\n  if (typeof fetch === 'function') {\n    const res = await fetch(url, { method, headers, body });\n    return { status: res.status, text: await res.text(), headers: { get: (n) => res.headers.get(n) } };\n  }\n\n  // 2. n8n's own HTTP helper — the transport that actually exists on Cloud.\n  if (_nodeHelpers && _nodeHelpers.httpRequest) {\n    try {\n      const res = await _nodeHelpers.httpRequest({\n        url, method, headers, body,\n        json: false,\n        returnFullResponse: true,\n        ignoreHttpStatusErrors: true,\n      });\n      return wrap(res.statusCode || 200, res.headers || {}, _toText(res.body));\n    } catch (err) {\n      // Older helpers throw on non-2xx instead of honouring\n      // ignoreHttpStatusErrors. Recover the status so 401 and 429 stay visible\n      // to the retry logic rather than surfacing as a generic failure.\n      const response = err && err.response;\n      const status = (err && (err.statusCode || err.httpCode))\n        || (response && (response.statusCode || response.status));\n      if (status) {\n        return wrap(Number(status), (response && response.headers) || {}, _toText(response && response.body));\n      }\n      throw err;\n    }\n  }\n\n  // 3. Raw https module, if the allowlist happens to permit it.\n  let https;\n  try {\n    https = require('https');\n  } catch (e) {\n    throw new Error('NO_HTTP_TRANSPORT: sandbox has no fetch, no this.helpers.httpRequest and no https module');\n  }\n  // Parsed with string ops rather than a regex: escaping a regex through this\n  // template literal is how the previous build silently produced a comment.\n  const withoutScheme = String(url).replace('https://', '').replace('http://', '');\n  const firstSlash = withoutScheme.indexOf('/');\n  const hostPort = firstSlash === -1 ? withoutScheme : withoutScheme.slice(0, firstSlash);\n  const path = firstSlash === -1 ? '/' : withoutScheme.slice(firstSlash);\n  const colon = hostPort.indexOf(':');\n  const hostname = colon === -1 ? hostPort : hostPort.slice(0, colon);\n  const port = colon === -1 ? 443 : Number(hostPort.slice(colon + 1));\n\n  return await new Promise((resolve, reject) => {\n    const req = https.request(\n      { hostname, port, path, method, headers },\n      (res) => {\n        let data = '';\n        res.setEncoding('utf8');\n        res.on('data', (chunk) => { data += chunk; });\n        res.on('end', () => resolve(wrap(res.statusCode, res.headers || {}, data)));\n      },\n    );\n    req.on('error', reject);\n    if (body) req.write(body);\n    req.end();\n  });\n}\n\nconst MCP_URL = 'https://mcp.silpo.ua/mcp';\nconst TOKEN_URL = 'https://mcp.silpo.ua/token';\nconst PROTOCOL_VERSION = '2025-06-18';\n\nfunction createMcp(session) {\n  let accessToken = session.access_token;\n  let refreshed = null;\n  let initialized = false;\n\n  async function refresh() {\n    const res = await httpFetch(TOKEN_URL, {\n      method: 'POST',\n      headers: { 'content-type': 'application/x-www-form-urlencoded' },\n      body: toQuery({\n        grant_type: 'refresh_token',\n        refresh_token: session.refresh_token,\n        client_id: session.client_id,\n        resource: MCP_URL,\n      }),\n    });\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_REAUTH_REQUIRED'); e.code = 'REAUTH'; throw e; }\n    const t = JSON.parse(res.text);\n    accessToken = t.access_token;\n    refreshed = {\n      access_token: t.access_token,\n      refresh_token: t.refresh_token || session.refresh_token,\n      expires_at: new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString(),\n    };\n    return accessToken;\n  }\n\n  async function rpc(method, params) {\n    const id = Math.floor(Math.random() * 1e9);\n    const send = () => httpFetch(MCP_URL, {\n      method: 'POST',\n      headers: {\n        'content-type': 'application/json',\n        accept: 'application/json, text/event-stream',\n        authorization: 'Bearer ' + accessToken,\n        'mcp-protocol-version': PROTOCOL_VERSION,\n      },\n      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),\n    });\n\n    let res = await send();\n    if (res.status === 401) { await refresh(); res = await send(); }\n    for (let i = 0; (res.status === 429 || res.status >= 500) && i < 5; i++) {\n      await sleep(Math.pow(2, i) * 1000 + Math.random() * 250);\n      res = await send();\n    }\n    if (res.status === 403) { const e = new Error('SILPO_FORBIDDEN'); e.code = 'FORBIDDEN'; throw e; }\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_MCP_ERROR_' + res.status); e.code = 'MCP'; throw e; }\n\n    const raw = res.text;\n    let msg;\n    if ((res.headers.get('content-type') || '').includes('text/event-stream')) {\n      for (const line of raw.split('\\n')) {\n        if (!line.startsWith('data:')) continue;\n        try { const m = JSON.parse(line.slice(5).trim()); if (m.id === id || m.error) msg = m; } catch (e) {}\n      }\n    } else { msg = JSON.parse(raw); }\n    if (!msg) throw new Error('SILPO_EMPTY_RESPONSE');\n    if (msg.error) throw new Error('SILPO_RPC_' + msg.error.code);\n    return msg.result;\n  }\n\n  return {\n    async call(name, args) {\n      if (!initialized) {\n        await rpc('initialize', {\n          protocolVersion: PROTOCOL_VERSION,\n          capabilities: {},\n          clientInfo: { name: 'silpo-optimizer-n8n', version: '1.0.0' },\n        });\n        initialized = true;\n      }\n      const result = await rpc('tools/call', { name, arguments: args || {} });\n      const textPart = (result.content || []).find(c => c.type === 'text');\n      let data = result;\n      if (textPart) { try { data = JSON.parse(textPart.text); } catch (e) { data = { raw: textPart.text }; } }\n      if (result.isError) {\n        const detail = typeof data === 'string' ? data : JSON.stringify(data);\n        const e = new Error('TOOL_ERROR_' + name + ': ' + String(detail).slice(0, 300));\n        e.code = 'TOOL';\n        e.detail = data;\n        throw e;\n      }\n      return data;\n    },\n    getRefreshed: () => refreshed,\n  };\n}\n\nasync function mapLimit(items, limit, fn) {\n  const out = new Array(items.length);\n  let cursor = 0;\n  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {\n    while (cursor < items.length) {\n      const i = cursor++;\n      try { out[i] = { ok: true, value: await fn(items[i], i) }; }\n      catch (e) { out[i] = { ok: false, error: e.message }; }\n    }\n  }));\n  return out;\n}\n\n/**\n * Optimization engine — the deterministic half.\n *\n * No network calls and no AI: MCP data in, numbers out. Every function is pure\n * so the whole module can be transpiled and inlined into an n8n Code node by\n * `src/workflow/build.ts` — the workflow and the local runs share one source.\n *\n * Prices come exclusively from MCP responses. The model never produces a number.\n */\n/* ------------------------------------------------------------------ sizes */\nconst UNIT_TO_BASE = {\n    'г': ['g', 1],\n    'гр': ['g', 1],\n    'кг': ['g', 1000],\n    'мл': ['ml', 1],\n    'л': ['ml', 1000],\n};\n/** Parses \"112,5г\", \"0,33л\", \"250мл\", \"1кг\" into a base unit (grams or ml). */\nfunction parseSize(text) {\n    if (!text)\n        return null;\n    // No `\\b` after the unit: Cyrillic letters are not word characters in\n    // JavaScript regexes, so a word boundary never matches after \"л\" or \"г\" and\n    // the pattern silently fails on every real value. A negative lookahead for a\n    // following letter does the same job correctly.\n    const match = String(text)\n        .toLowerCase()\n        .replace(',', '.')\n        .match(/(\\d+(?:\\.\\d+)?)\\s*(кг|гр|г|мл|л)(?![а-щьюяїієґa-z])/);\n    if (!match)\n        return null;\n    const entry = UNIT_TO_BASE[match[2]];\n    if (!entry)\n        return null;\n    return { value: parseFloat(match[1]) * entry[1], unit: entry[0] };\n}\n/**\n * Fat or content percentage from a name: \"молоко 2,5%\", \"масло екстра 82%\".\n *\n * Unlike pack size, this is genuinely present in the data — 139 of 288 candidate\n * names carry one — and it separates grades that are otherwise near-identical by\n * name: butter 82% vs 72.5%, sour cream 15% vs 20%.\n */\nfunction parsePercent(text) {\n    if (!text)\n        return null;\n    const match = String(text).replace(',', '.').match(/(\\d+(?:\\.\\d+)?)\\s*%/);\n    return match ? parseFloat(match[1]) : null;\n}\n/** Pack size of a product: the `ratio` field first, then the name as fallback. */\nfunction sizeOf(product) {\n    return parseSize(product.ratio) ?? parseSize(product.name) ?? null;\n}\n/** Price per base unit (UAH per gram or ml), or null when size is unknown. */\nfunction unitPrice(product) {\n    const size = sizeOf(product);\n    if (!size?.value)\n        return null;\n    return product.price / size.value;\n}\n/* -------------------------------------------------------------- similarity */\nconst STOPWORDS = new Set(['з', 'зі', 'та', 'і', 'й', 'у', 'в', 'на', 'для', 'без', 'від', 'до', 'т', 'б', 'шт', 'уп', 'пак', 'ж', 'мдж']);\nfunction tokenize(name) {\n    return String(name)\n        .toLowerCase()\n        .replace(/[«»\"'’,.()\\/\\\\-]/g, ' ')\n        .split(/\\s+/)\n        .filter((t) => t && t.length > 1 && !STOPWORDS.has(t) && !/^\\d+([.,]\\d+)?(г|кг|мл|л|%)?$/.test(t));\n}\n/** Product type — the first meaningful word (\"Напій\", \"Батончик\", \"Сирок\"). */\nfunction headNoun(name) {\n    return tokenize(name)[0] ?? '';\n}\n/** Jaccard overlap of name tokens, 0..1. */\nfunction jaccard(a, b) {\n    const setA = new Set(tokenize(a));\n    const setB = new Set(tokenize(b));\n    if (!setA.size || !setB.size)\n        return 0;\n    let intersection = 0;\n    for (const token of setA)\n        if (setB.has(token))\n            intersection++;\n    return intersection / (setA.size + setB.size - intersection);\n}\n/** Latin tokens as a brand proxy (Alpro, Snickers, Kit Kat) — the API has no brand field. */\nfunction latinTokens(name) {\n    return new Set(String(name).toLowerCase().match(/[a-z][a-z0-9]{2,}/g) ?? []);\n}\n/* ------------------------------------------------------------------ scoring */\n/**\n * Weights are taken verbatim from the brief.\n *\n * The brief also lists `categoryMatchScore`, but leaves it out of the formula —\n * the weights already sum to 1.00 without it. Category is folded into\n * `similarityScore` through the head-noun match instead.\n */\nconst WEIGHTS = {\n    similarity: 0.4,\n    priceSaving: 0.25,\n    brandMatch: 0.1,\n    sizeMatch: 0.1,\n    promotion: 0.1,\n    availability: 0.05,\n};\nfunction round2(n) {\n    return Math.round((n + Number.EPSILON) * 100) / 100;\n}\nfunction scoreCandidate(original, candidate, quantity = 1) {\n    // Similarity: name overlap plus an explicit product-type match.\n    const overlap = jaccard(original.name, candidate.name);\n    const sameHead = headNoun(original.name) === headNoun(candidate.name);\n    const similarityScore = Math.min(1, overlap * 0.7 + (sameHead ? 0.3 : 0));\n    const originalSize = sizeOf(original);\n    const candidateSize = sizeOf(candidate);\n    const sameUnitFamily = Boolean(originalSize && candidateSize && originalSize.unit === candidateSize.unit);\n    const sizeRatio = sameUnitFamily && originalSize && candidateSize ? candidateSize.value / originalSize.value : null;\n    // Unknown size stays neutral: neither rewarded nor punished.\n    const sizeMatchScore = sizeRatio ? Math.max(0, 1 - Math.abs(Math.log2(sizeRatio))) : 0.5;\n    const originalBrand = latinTokens(original.name);\n    const candidateBrand = latinTokens(candidate.name);\n    const sharedBrand = [...originalBrand].some((t) => candidateBrand.has(t));\n    const brandMatchScore = sharedBrand ? 1 : originalBrand.size === 0 && candidateBrand.size === 0 ? 0.5 : 0.2;\n    // Saving is deterministic and sourced from MCP prices only.\n    const savingPerUnit = original.price - candidate.price;\n    const saving = round2(savingPerUnit * quantity);\n    const savingPct = original.price > 0 ? savingPerUnit / original.price : 0;\n    const priceSavingScore = Math.max(0, Math.min(1, savingPct / 0.4)); // -40% saturates\n    const originalUnit = unitPrice(original);\n    const candidateUnit = unitPrice(candidate);\n    const unitSavingPct = originalUnit && candidateUnit ? (originalUnit - candidateUnit) / originalUnit : null;\n    const promotionScore = candidate.oldPrice != null ? 1 : 0;\n    const availabilityScore = candidate.available && (candidate.stock ?? 0) >= quantity ? 1 : 0;\n    // Candidate pack size is unavailable from MCP (see docs/engine-findings.md).\n    // A steep drop within the same product type is the only signal left that the\n    // replacement might simply be a smaller package.\n    const sizeUnknown = !sameUnitFamily;\n    // Identical name, materially lower price. Silpo lists the same product in\n    // several pack sizes under one name — «Сметана Яготинська 15% стакан» is both\n    // 300 g at 57.49 and 180 g at 32.99 — so when the names match exactly, the\n    // difference is almost certainly the pack, not a better deal.\n    const sameName = tokenize(original.name).join(' ') === tokenize(candidate.name).join(' ');\n    const suspiciousDrop = sizeUnknown && (savingPct >= 0.5 || (sameName && savingPct >= 0.15));\n    // The brief is explicit that 2.5% milk must be replaced by 2.5% milk. One\n    // percentage point of slack covers rounding between labels (2.5 vs 2.6) while\n    // still separating grades (82 vs 72.5).\n    const originalPercent = parsePercent(original.name);\n    const candidatePercent = parsePercent(candidate.name);\n    const percentMismatch = originalPercent != null && candidatePercent != null && Math.abs(originalPercent - candidatePercent) > PERCENT_TOLERANCE;\n    const scores = {\n        similarityScore: round2(similarityScore),\n        priceSavingScore: round2(priceSavingScore),\n        brandMatchScore: round2(brandMatchScore),\n        sizeMatchScore: round2(sizeMatchScore),\n        promotionScore,\n        availabilityScore,\n    };\n    const finalScore = similarityScore * WEIGHTS.similarity +\n        priceSavingScore * WEIGHTS.priceSaving +\n        brandMatchScore * WEIGHTS.brandMatch +\n        sizeMatchScore * WEIGHTS.sizeMatch +\n        promotionScore * WEIGHTS.promotion +\n        availabilityScore * WEIGHTS.availability;\n    return {\n        productId: candidate.id,\n        companyId: candidate.companyId,\n        branchId: candidate.branchId,\n        slug: candidate.slug,\n        name: candidate.name,\n        price: candidate.price,\n        oldPrice: candidate.oldPrice ?? null,\n        ratio: candidate.ratio ?? null,\n        stock: candidate.stock ?? 0,\n        available: Boolean(candidate.available),\n        saving,\n        savingPct: round2(savingPct * 100),\n        unitSavingPct: unitSavingPct == null ? null : round2(unitSavingPct * 100),\n        sizeRatio: sizeRatio == null ? null : round2(sizeRatio),\n        sameUnitFamily,\n        sizeUnknown,\n        suspiciousDrop,\n        originalPercent,\n        candidatePercent,\n        percentMismatch,\n        onPromotion: candidate.oldPrice != null,\n        scores,\n        finalScore: round2(finalScore),\n    };\n}\n/* ---------------------------------------------------------------- filtering */\n/** Percentage points of slack allowed between an original and its replacement. */\nconst PERCENT_TOLERANCE = 1;\nconst THRESHOLDS = {\n    /** Below this the candidate is a different kind of product entirely. */\n    minSimilarity: 0.35,\n    minFinalScore: 0.55,\n    /** UAH — smaller gains are not worth bothering the customer with. */\n    minSaving: 1,\n    /**\n     * Pack sizes must be close, not merely within an order of magnitude. At the\n     * old 2x band a 300 g sour cream was replaced by a 180 g one: 4% cheaper per\n     * gram, but 40% less product — two packs would cost more than the original.\n     */\n    minSizeRatio: 0.8,\n    maxSizeRatio: 1.25,\n    minUnitSavingPct: 0,\n};\n/**\n * Drops unsuitable candidates. The governing rule from the brief: preserve what\n * the customer actually intended to buy, rather than find the cheapest thing.\n */\nfunction filterCandidates(original, scored, quantity = 1) {\n    return scored\n        .filter((c) => {\n        // `similar_products` returns the original product itself as a candidate.\n        if (c.productId === original.productId)\n            return false;\n        if (!c.available || c.stock < quantity)\n            return false;\n        // Different fat or content grade — a different product, not a cheaper one.\n        if (c.percentMismatch)\n            return false;\n        if (c.saving < THRESHOLDS.minSaving)\n            return false;\n        if (c.scores.similarityScore < THRESHOLDS.minSimilarity)\n            return false;\n        if (c.finalScore < THRESHOLDS.minFinalScore)\n            return false;\n        // When both sizes are known, the pack must be comparable.\n        if (c.sizeRatio != null && (c.sizeRatio > THRESHOLDS.maxSizeRatio || c.sizeRatio < THRESHOLDS.minSizeRatio)) {\n            return false;\n        }\n        // A saving that comes purely from a smaller pack is not a saving.\n        if (c.unitSavingPct != null && c.unitSavingPct <= THRESHOLDS.minUnitSavingPct)\n            return false;\n        return true;\n    })\n        .sort((a, b) => b.finalScore - a.finalScore);\n}\n/**\n * Builds the plan. Only positive savings are summed.\n * Loyalty bonuses are reported separately and never added to the total.\n */\nfunction buildPlan(cartItems, perItemBest, loyalty) {\n    const replacements = [];\n    for (const { item, best } of perItemBest) {\n        if (!best || best.saving <= 0)\n            continue;\n        replacements.push({\n            originalProductId: item.productId,\n            originalName: item.name,\n            originalPrice: item.price,\n            originalRatio: item.ratio ?? null,\n            quantity: item.quantity,\n            replacementProductId: best.productId,\n            replacementCompanyId: best.companyId,\n            replacementBranchId: best.branchId,\n            replacementName: best.name,\n            replacementPrice: best.price,\n            replacementRatio: best.ratio,\n            onPromotion: best.onPromotion,\n            brand: best.brand ?? null,\n            alternates: best.alternates ?? [],\n            saving: best.saving,\n            savingPct: best.savingPct,\n            finalScore: best.finalScore,\n            scores: best.scores,\n            verifySize: best.suspiciousDrop,\n        });\n    }\n    const originalTotal = round2(cartItems.reduce((sum, item) => sum + item.total, 0));\n    const totalSaving = round2(replacements.reduce((sum, r) => sum + r.saving, 0));\n    return {\n        replacements,\n        summary: {\n            itemsAnalyzed: cartItems.length,\n            replacementsFound: replacements.length,\n            promotionsUsed: replacements.filter((r) => r.onPromotion).length,\n            originalTotal,\n            optimizedTotal: round2(originalTotal - totalSaving),\n            saving: totalSaving,\n            savingPct: originalTotal > 0 ? round2((totalSaving / originalTotal) * 100) : 0,\n            bonusAvailable: loyalty?.bonusAvailable ?? 0,\n        },\n    };\n}\n\n// Read the row from Validate Plan by name: Claim Plan and Send Applying sit\n// between them, so $input here is a Telegram response, not the plan.\nconst row = $('Validate Plan').first().json;\nconst route = $('Merge Session').first().json;\n\n// Validate Plan already rejected anything unowned, stale or already applied.\nif (row.invalid) {\n  return [{ json: { chatId: row.chatId, expired: true, text: row.text } }];\n}\n\nconst plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;\nconst mcp = createMcp(route.session);\n\n// Re-read the cart first: another session may have changed it since the analysis.\nconst before = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId: plan.shoppingCartId });\nconst beforeItems = before.cart.shipments.flatMap(s => s.products);\nconst beforeTotal = before.cart.calculation.total;\n\n// Only what the guest left ticked. Missing selection means an older plan, where\n// everything was implied.\nconst selected = Array.isArray(plan.selected)\n  ? plan.selected\n  : plan.replacements.map((r, i) => i);\nconst chosen = plan.replacements.filter((r, i) => selected.indexOf(i) !== -1);\nconst deselected = plan.replacements.length - chosen.length;\n\nconst applicable = chosen.filter(r =>\n  beforeItems.some(i => i.productId === r.originalProductId));\nconst vanished = chosen.length - applicable.length;\n\nif (!applicable.length) {\n  return [{ json: { chatId: route.chatId, expired: true,\n    text: '🔄 Кошик змінився з моменту аналізу — жодної із запропонованих позицій у ньому вже немає.\\n\\nЗапустіть /optimize ще раз.' }}];\n}\n\n// Pack size is invisible until an item sits in the cart, so applying is a\n// retry loop rather than a single pass: add a candidate, look at what the cart\n// says about it, and fall back to the next one when it disagrees.\n//\n// Batched by round rather than per item — one cart read serves every candidate\n// tried in that round, so the whole thing costs at most MAX_ROUNDS reads no\n// matter how many replacements there are.\nconst MAX_ROUNDS = 3;\n\nconst queue = applicable.map(replacement => {\n  const original = beforeItems.find(i => i.productId === replacement.originalProductId);\n  const primary = {\n    productId: replacement.replacementProductId,\n    companyId: replacement.replacementCompanyId,\n    branchId: replacement.replacementBranchId,\n    name: replacement.replacementName,\n    price: replacement.replacementPrice,\n    saving: replacement.saving,\n  };\n  return {\n    replacement,\n    original,\n    options: [primary].concat(replacement.alternates || []),\n    attempt: 0,\n    settled: false,\n    chosen: null,\n    reason: null,\n    detail: null,\n  };\n});\n\nconst failed = [];\n\nfor (let round = 0; round < MAX_ROUNDS; round++) {\n  const active = queue.filter(q => !q.settled && q.options[q.attempt]);\n  if (!active.length) break;\n\n  // 1. add this round's candidate for every unsettled replacement\n  for (const q of active) {\n    const option = q.options[q.attempt];\n    q.added = false;\n    let lastError = null;\n    for (let tries = 0; tries < 3 && !q.added; tries++) {\n      if (tries > 0) await sleep(700 * tries);\n      try {\n        await mcp.call('silpo_add_or_update_cart_products', {\n          shoppingCartId: plan.shoppingCartId,\n          products: [{\n            productId: option.productId,\n            companyId: option.companyId,\n            branchId: option.branchId,\n            quantity: q.original.quantity,\n            addQuantity: false,\n          }],\n        });\n        q.added = true;\n      } catch (e) {\n        lastError = e;\n      }\n    }\n    if (!q.added) {\n      q.reason = 'add-failed';\n      q.detail = lastError ? String(lastError.message).slice(0, 160) : 'unknown';\n      q.attempt++;\n    }\n    await sleep(250);\n  }\n\n  // 2. one read for the whole round - this is where ratio finally appears\n  const mid = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId: plan.shoppingCartId });\n  const midItems = mid.cart.shipments.flatMap(s => s.products);\n  const rollback = [];\n\n  for (const q of active) {\n    if (!q.added) continue;\n    const option = q.options[q.attempt];\n    const line = midItems.find(i => i.productId === option.productId);\n\n    // Availability: the cart overrules the search index.\n    if (line && q.original && q.original.stock > 0 && line.stock === 0) {\n      q.reason = 'unavailable';\n      q.detail = option.name;\n      rollback.push(option.productId);\n      q.attempt++;\n      continue;\n    }\n\n    const originalSize = q.original ? sizeOf(q.original) : null;\n    const newSize = line ? sizeOf(line) : null;\n    if (originalSize && newSize && originalSize.unit === newSize.unit) {\n      const factor = newSize.value / originalSize.value;\n      if (factor > THRESHOLDS.maxSizeRatio || factor < THRESHOLDS.minSizeRatio) {\n        q.reason = 'size';\n        q.detail = { name: option.name, from: q.original.ratio, to: line.ratio };\n        rollback.push(option.productId);\n        q.attempt++;\n        continue;\n      }\n    }\n\n    q.settled = true;\n    q.chosen = { option: option, ratio: line ? line.ratio : null, fallbackUsed: q.attempt > 0 };\n  }\n\n  if (rollback.length) {\n    try {\n      await mcp.call('silpo_remove_cart_products', {\n        shoppingCartId: plan.shoppingCartId,\n        products: rollback.map(id => ({ productId: id })),\n      });\n    } catch (e) { /* final read reports the truth */ }\n  }\n}\n\n// 3. originals go only for replacements that survived every check\nconst confirmed = queue.filter(q => q.settled);\nif (confirmed.length) {\n  try {\n    await mcp.call('silpo_remove_cart_products', {\n      shoppingCartId: plan.shoppingCartId,\n      products: confirmed.map(q => ({ productId: q.replacement.originalProductId })),\n    });\n  } catch (e) { /* the original stays; verification will show it */ }\n}\n\n// The attempt counter also equals how many candidates were tried and failed.\nconst sizeRejected = queue.filter(q => !q.settled && q.reason === 'size')\n  .map(q => ({\n    originalName: q.replacement.originalName,\n    name: q.detail.name,\n    originalRatio: q.detail.from,\n    newRatio: q.detail.to,\n    tried: q.attempt,\n    available: q.options.length,\n  }));\nconst stockRejected = queue.filter(q => !q.settled && q.reason === 'unavailable')\n  .map(q => ({\n    originalName: q.replacement.originalName,\n    name: q.detail,\n    tried: q.attempt,\n    available: q.options.length,\n  }));\nfor (const q of queue.filter(q => !q.settled && q.reason === 'add-failed')) {\n  failed.push({ name: q.options[Math.min(q.attempt, q.options.length - 1)].name, error: q.detail });\n}\nconst substituted = confirmed.filter(q => q.chosen.fallbackUsed)\n  .map(q => ({ planned: q.replacement.replacementName, used: q.chosen.option.name }));\n\n\n// Mandatory verification: the headline number must come from the cart itself.\nconst after = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId: plan.shoppingCartId });\nconst afterTotal = after.cart.calculation.total;\n\nreturn [{ json: {\n  chatId: route.chatId,\n  planId: row.plan_id,\n  applied: confirmed.length,\n  deselected,\n  failed,\n  sizeRejected,\n  stockRejected,\n  substituted,\n  vanished,\n  beforeTotal,\n  afterTotal,\n  actualSaving: round2(beforeTotal - afterTotal),\n  promisedSaving: plan.summary.saving,\n  loyalty: after.loyalty || {},\n  validations: after.cart.calculation.validations || [],\n}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "apply-changes",
+      "name": "Apply Changes",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1400,
+        240
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "valid",
+              "operator": {
+                "type": "boolean",
+                "operation": "false",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.invalid }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "plan-valid-",
+      "name": "Plan Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        740,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.plan_id }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "applying"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "plan_id",
+              "displayName": "plan_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cart_id",
+              "displayName": "cart_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "plan_json",
+              "displayName": "plan_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_total",
+              "displayName": "original_total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "claim-plan",
+      "name": "Claim Plan",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        960,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Merge Session').first().json.chatId }}",
+        "text": "⏳ Застосовую зміни до кошика…",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-applying",
+      "name": "Send Applying",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1180,
+        240
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-plan-invalid",
+      "name": "Send Plan Invalid",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        440
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.planId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "applied"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "plan_id",
+              "displayName": "plan_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cart_id",
+              "displayName": "cart_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "plan_json",
+              "displayName": "plan_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_total",
+              "displayName": "original_total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "mark-plan-applied",
+      "name": "Mark Plan Applied",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1620,
+        240
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\nconst WISHES = [\n  'Нехай попереду буде тиждень, у якому все складається легше, ніж здавалося.',\n  'Найсмачніше в цьому кошику — те, що ви приготуєте самі.',\n  'Дрібні заощадження мають звичку перетворюватися на великі радощі.',\n  'Завтра трапиться щось приємне. Дрібниця, але точно вчасно.',\n  'Хтось сьогодні згадає вас добрим словом. Можливо, за вечерю.',\n  'Хороший день починається просто: смачно поїсти й нікуди не поспішати.',\n  'Нехай удома на вас чекає тиша або сміх — залежно від того, чого більше хочеться.',\n  'Іноді найкращий план на вечір — це добре повечеряти.',\n  'Ви щойно виграли трохи часу для себе. Витратьте його без користі.',\n  'Те, що ви шукали, знайдеться. Найімовірніше, на нижній полиці.',\n  'У цьому тижні буде день, який захочеться запам’ятати. Не пропустіть його.',\n  'Смак дому не залежить від ціни. Але приємно, коли він ще й вигідний.'\n];\n\nfunction pickWish(saving, applied) {\n  if (applied === 0) return 'Ваш кошик уже такий, як треба. Як і цей день.';\n  if (saving >= 150) return 'Такою економією можна пишатися. Або мовчки купити собі каву.';\n  if (saving > 0 && saving < 10) return 'Навіть маленька економія — це привід зробити собі щось приємне.';\n  return WISHES[Math.floor(Math.random() * WISHES.length)];\n}\n\n// The headline demo metric is the actual cart total after the change.\nconst result = $('Apply Changes').first().json;\nconst money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n\nif (result.expired) return [{ json: { chatId: result.chatId, text: result.text } }];\n\nlet text = '🎉 *Оптимізація застосована*\\n\\n'\n  + 'Було:\\n*' + money(result.beforeTotal) + '*\\n\\n'\n  + 'Стало:\\n*' + money(result.afterTotal) + '*\\n\\n'\n  + '💰 *ФАКТИЧНО ЗЕКОНОМЛЕНО:*\\n*' + money(result.actualSaving) + '*\\n\\n'\n  + '─────────────\\n'\n  + result.applied + ' замін застосовано';\n\nif (result.failed && result.failed.length) {\n  text += '\\n\\n⚠️ *Не вдалося застосувати:*';\n  for (const item of result.failed) {\n    text += '\\n• ' + item.name + '\\n  _' + String(item.error).slice(0, 140) + '_';\n  }\n}\n// Availability and size can only be checked once the item is in the cart, so\n// these rollbacks are reported explicitly rather than hidden.\nif (result.stockRejected && result.stockRejected.length) {\n  text += '\\n\\n🚫 *Не знайшов доступної заміни:*';\n  for (const item of result.stockRejected) {\n    text += '\\n• ' + item.originalName\n      + (item.tried > 1 ? '\\n  перебрав ' + item.tried + ' варіанти — усі виявились недоступні' : '\\n  залишив оригінал');\n  }\n  text += '\\n\\n_У пошуку «Сільпо» вони значилися доступними, але кошик показав інше._'\n    + ' _Кошик тут головніший._';\n}\nif (result.sizeRejected && result.sizeRejected.length) {\n  text += '\\n\\n📦 *Не знайшов заміни того ж об\\'єму:*';\n  for (const item of result.sizeRejected) {\n    text += '\\n• ' + item.originalName + ' (' + item.originalRatio + ')'\n      + '\\n  найближче було ' + item.newRatio + ' — не підійшло'\n      + (item.tried > 1 ? ', перебрав ' + item.tried + ' варіанти' : '')\n      + '\\n  залишив оригінал';\n  }\n  // The guest cannot see why this happens only now, so say it plainly.\n  text += '\\n\\n_«Сільпо» не показує об\\'єм упаковки в пошуку — я бачу його лише тоді,'\n    + ' коли товар уже в кошику. Тому перевіряю після додавання: менша упаковка за меншу ціну'\n    + ' це не економія, адже двох таких коштуватимуть дорожче за оригінал._';\n}\nif (result.vanished) {\n  text += '\\n↩️ ' + result.vanished + ' позицій уже не було в кошику';\n}\nif (result.deselected) {\n  text += '\\n☐ ' + result.deselected + ' замін ви не обрали';\n}\n// The card showed one product; the cart proved it wrong and a runner-up went in\n// instead. Saying which keeps the message honest about what was bought.\nif (result.substituted && result.substituted.length) {\n  text += '\\n\\n🔄 *Підставив інший товар:*';\n  for (const item of result.substituted) {\n    text += '\\n• замість ' + item.planned + '\\n  взяв ' + item.used;\n  }\n}\nif (Math.abs(result.actualSaving - result.promisedSaving) > 1) {\n  text += '\\n\\n_Фактична економія відрізняється від прогнозу — ціни або наявність змінилися._';\n}\nconst bonus = result.loyalty && result.loyalty.bonusAvailable;\nif (bonus > 0) {\n  text += '\\n\\n💳 Балабонуси: ' + bonus + ' грн — застосуйте при оформленні.';\n}\nconst errors = (result.validations || []).filter(v => v.level === 'error');\nif (errors.length) {\n  text += '\\n\\n⚠️ Кошик потребує уваги: ' + errors.map(e => e.message).join(', ');\n}\n\n// Labelled so it reads as the receipt-style closing line it is, rather than a\n// stray remark. Not attributed to Silpo: these texts are ours.\ntext += '\\n\\n─────────────\\n🧾 *Побажання до вашого чека*\\n_'\n  + pickWish(result.actualSaving, result.applied) + '_';\n\nreturn [{ json: { chatId: result.chatId, text } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "format-result",
+      "name": "Format Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1180,
+        320
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-result",
+      "name": "Send Result",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1400,
+        320
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "❌ Скасовано. Кошик не змінювався.\n\nЗапустіть /optimize, коли будете готові.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-cancelled",
+      "name": "Send Cancelled",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        520
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\n\n*Основне*\n/connect — підключити акаунт Сільпо\n/cart — показати кошик\n/optimize — знайти, де можна зекономити\n\n*Якщо якусь марку не хочете бачити в замінах*\n/blocked — ваш список винятків\n/block + назва марки — не пропонувати її\n/unblock + назва марки — повернути\n\n_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\n\nЯ шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-help",
+      "name": "Send Help",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        520,
+        660
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "operation": "get",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $json.planId }}"
+            }
+          ]
+        }
+      },
+      "id": "load-plan-details",
+      "name": "Load Plan Details",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        520,
+        800
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Full breakdown behind the \"details\" button. Ownership is re-checked here for\n// the same reason as in Validate Plan: a plan id alone must not reveal another\n// customer's cart.\nconst route = $('Merge Session').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);\nconst row = rows.find(r => String(r.plan_id) === String(route.planId));\n\nif (!row || String(row.telegram_user_id) !== String(route.telegramUserId)) {\n  return [{ json: { chatId: route.chatId,\n    text: '⏳ План не знайдено або він застарів.\\n\\nЗапустіть /optimize ще раз.' }}];\n}\n\nconst plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;\nconst money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\nconst replacements = plan.replacements || [];\n\nconst blocks = replacements.map((r, i) =>\n  (i + 1) + '. *' + r.originalName + '*\\n'\n  + '   ' + money(r.originalPrice) + (r.quantity > 1 ? ' × ' + r.quantity : '') + '\\n'\n  + '   ↓\\n'\n  + '   *' + r.replacementName + '*\\n'\n  + '   ' + money(r.replacementPrice) + (r.onPromotion ? '  🎁 акція' : '') + '\\n'\n  + '   💰 економія ' + money(r.saving) + ' (−' + r.savingPct + '%)'\n  + (r.aiReason ? '\\n   💬 ' + r.aiReason : '')\n  + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм упаковки' : ''));\n\nlet text = '🔍 *Деталі оптимізації*\\n\\n'\n  + 'Було: ' + money(plan.summary.originalTotal) + '\\n'\n  + 'Стане: ' + money(plan.summary.originalTotal - plan.summary.saving) + '\\n'\n  + '💰 Економія: *' + money(plan.summary.saving) + '*\\n\\n'\n  + '─────────────\\n\\n';\n\n// Telegram caps a message at 4096 characters.\nconst LIMIT = 3900;\nconst kept = [];\nfor (const block of blocks) {\n  if ((text + kept.join('\\n\\n') + block).length > LIMIT) break;\n  kept.push(block);\n}\ntext += kept.join('\\n\\n');\nif (kept.length < blocks.length) {\n  text += '\\n\\n_…і ще ' + (blocks.length - kept.length) + ' замін — не вмістилися в повідомлення._';\n}\n\nreturn [{ json: { chatId: route.chatId, planId: row.plan_id, text } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "format-details",
+      "name": "Format Details",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        740,
+        800
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✅ Застосувати",
+                    "additionalFields": {
+                      "type": "callback_data",
+                      "callback_data": "=apply:{{ $json.planId }}"
+                    }
+                  },
+                  {
+                    "text": "❌ Скасувати",
+                    "additionalFields": {
+                      "type": "callback_data",
+                      "callback_data": "=cancel:{{ $json.planId }}"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-details",
+      "name": "Send Details",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        800
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\n\n// The Code-node sandbox is a restricted VM, not Node: there is no fetch, no URL\n// and no URLSearchParams, and require() is limited to an allowlist - 'crypto'\n// loads, 'url' and 'buffer' are rejected outright.\n//\n// Buffer is therefore taken from a real Buffer instance produced by crypto,\n// which needs no module and no global.\nconst Buf = require('crypto').randomBytes(0).constructor;\n\n// The node context is bound to 'this' only at the top level of a Code node;\n// inside a plain function call it is undefined. Capture the helper here.\nconst _nodeHelpers = (function () {\n  try {\n    return this && this.helpers ? this.helpers : null;\n  } catch (e) {\n    return null;\n  }\n}).call(this);\n\nfunction _toText(raw) {\n  if (raw === undefined || raw === null) return '';\n  if (typeof raw === 'string') return raw;\n  if (raw.constructor === Buf) return raw.toString('utf8');\n  if (raw.type === 'Buffer' && Array.isArray(raw.data)) return Buf.from(raw.data).toString('utf8');\n  return JSON.stringify(raw);\n}\n\nfunction sleep(ms) {\n  if (typeof setTimeout !== 'function') return Promise.resolve();\n  return new Promise((resolve) => setTimeout(resolve, ms));\n}\n\nfunction toQuery(params) {\n  return Object.keys(params)\n    .filter((k) => params[k] !== undefined && params[k] !== null)\n    .map((k) => encodeURIComponent(k) + '=' + encodeURIComponent(params[k]))\n    .join('&');\n}\n\nasync function httpFetch(url, opts) {\n  const method = (opts && opts.method) || 'GET';\n  const headers = (opts && opts.headers) || {};\n  const body = opts && opts.body;\n  const wrap = (status, headerObj, text) => ({\n    status,\n    text,\n    headers: { get: (n) => headerObj[String(n).toLowerCase()] },\n  });\n\n  // 1. Native fetch, when the runtime provides it.\n  if (typeof fetch === 'function') {\n    const res = await fetch(url, { method, headers, body });\n    return { status: res.status, text: await res.text(), headers: { get: (n) => res.headers.get(n) } };\n  }\n\n  // 2. n8n's own HTTP helper — the transport that actually exists on Cloud.\n  if (_nodeHelpers && _nodeHelpers.httpRequest) {\n    try {\n      const res = await _nodeHelpers.httpRequest({\n        url, method, headers, body,\n        json: false,\n        returnFullResponse: true,\n        ignoreHttpStatusErrors: true,\n      });\n      return wrap(res.statusCode || 200, res.headers || {}, _toText(res.body));\n    } catch (err) {\n      // Older helpers throw on non-2xx instead of honouring\n      // ignoreHttpStatusErrors. Recover the status so 401 and 429 stay visible\n      // to the retry logic rather than surfacing as a generic failure.\n      const response = err && err.response;\n      const status = (err && (err.statusCode || err.httpCode))\n        || (response && (response.statusCode || response.status));\n      if (status) {\n        return wrap(Number(status), (response && response.headers) || {}, _toText(response && response.body));\n      }\n      throw err;\n    }\n  }\n\n  // 3. Raw https module, if the allowlist happens to permit it.\n  let https;\n  try {\n    https = require('https');\n  } catch (e) {\n    throw new Error('NO_HTTP_TRANSPORT: sandbox has no fetch, no this.helpers.httpRequest and no https module');\n  }\n  // Parsed with string ops rather than a regex: escaping a regex through this\n  // template literal is how the previous build silently produced a comment.\n  const withoutScheme = String(url).replace('https://', '').replace('http://', '');\n  const firstSlash = withoutScheme.indexOf('/');\n  const hostPort = firstSlash === -1 ? withoutScheme : withoutScheme.slice(0, firstSlash);\n  const path = firstSlash === -1 ? '/' : withoutScheme.slice(firstSlash);\n  const colon = hostPort.indexOf(':');\n  const hostname = colon === -1 ? hostPort : hostPort.slice(0, colon);\n  const port = colon === -1 ? 443 : Number(hostPort.slice(colon + 1));\n\n  return await new Promise((resolve, reject) => {\n    const req = https.request(\n      { hostname, port, path, method, headers },\n      (res) => {\n        let data = '';\n        res.setEncoding('utf8');\n        res.on('data', (chunk) => { data += chunk; });\n        res.on('end', () => resolve(wrap(res.statusCode, res.headers || {}, data)));\n      },\n    );\n    req.on('error', reject);\n    if (body) req.write(body);\n    req.end();\n  });\n}\n\nconst MCP_URL = 'https://mcp.silpo.ua/mcp';\nconst TOKEN_URL = 'https://mcp.silpo.ua/token';\nconst PROTOCOL_VERSION = '2025-06-18';\n\nfunction createMcp(session) {\n  let accessToken = session.access_token;\n  let refreshed = null;\n  let initialized = false;\n\n  async function refresh() {\n    const res = await httpFetch(TOKEN_URL, {\n      method: 'POST',\n      headers: { 'content-type': 'application/x-www-form-urlencoded' },\n      body: toQuery({\n        grant_type: 'refresh_token',\n        refresh_token: session.refresh_token,\n        client_id: session.client_id,\n        resource: MCP_URL,\n      }),\n    });\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_REAUTH_REQUIRED'); e.code = 'REAUTH'; throw e; }\n    const t = JSON.parse(res.text);\n    accessToken = t.access_token;\n    refreshed = {\n      access_token: t.access_token,\n      refresh_token: t.refresh_token || session.refresh_token,\n      expires_at: new Date(Date.now() + (t.expires_in || 3600) * 1000).toISOString(),\n    };\n    return accessToken;\n  }\n\n  async function rpc(method, params) {\n    const id = Math.floor(Math.random() * 1e9);\n    const send = () => httpFetch(MCP_URL, {\n      method: 'POST',\n      headers: {\n        'content-type': 'application/json',\n        accept: 'application/json, text/event-stream',\n        authorization: 'Bearer ' + accessToken,\n        'mcp-protocol-version': PROTOCOL_VERSION,\n      },\n      body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),\n    });\n\n    let res = await send();\n    if (res.status === 401) { await refresh(); res = await send(); }\n    for (let i = 0; (res.status === 429 || res.status >= 500) && i < 5; i++) {\n      await sleep(Math.pow(2, i) * 1000 + Math.random() * 250);\n      res = await send();\n    }\n    if (res.status === 403) { const e = new Error('SILPO_FORBIDDEN'); e.code = 'FORBIDDEN'; throw e; }\n    if (res.status < 200 || res.status >= 300) { const e = new Error('SILPO_MCP_ERROR_' + res.status); e.code = 'MCP'; throw e; }\n\n    const raw = res.text;\n    let msg;\n    if ((res.headers.get('content-type') || '').includes('text/event-stream')) {\n      for (const line of raw.split('\\n')) {\n        if (!line.startsWith('data:')) continue;\n        try { const m = JSON.parse(line.slice(5).trim()); if (m.id === id || m.error) msg = m; } catch (e) {}\n      }\n    } else { msg = JSON.parse(raw); }\n    if (!msg) throw new Error('SILPO_EMPTY_RESPONSE');\n    if (msg.error) throw new Error('SILPO_RPC_' + msg.error.code);\n    return msg.result;\n  }\n\n  return {\n    async call(name, args) {\n      if (!initialized) {\n        await rpc('initialize', {\n          protocolVersion: PROTOCOL_VERSION,\n          capabilities: {},\n          clientInfo: { name: 'silpo-optimizer-n8n', version: '1.0.0' },\n        });\n        initialized = true;\n      }\n      const result = await rpc('tools/call', { name, arguments: args || {} });\n      const textPart = (result.content || []).find(c => c.type === 'text');\n      let data = result;\n      if (textPart) { try { data = JSON.parse(textPart.text); } catch (e) { data = { raw: textPart.text }; } }\n      if (result.isError) {\n        const detail = typeof data === 'string' ? data : JSON.stringify(data);\n        const e = new Error('TOOL_ERROR_' + name + ': ' + String(detail).slice(0, 300));\n        e.code = 'TOOL';\n        e.detail = data;\n        throw e;\n      }\n      return data;\n    },\n    getRefreshed: () => refreshed,\n  };\n}\n\nasync function mapLimit(items, limit, fn) {\n  const out = new Array(items.length);\n  let cursor = 0;\n  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, async () => {\n    while (cursor < items.length) {\n      const i = cursor++;\n      try { out[i] = { ok: true, value: await fn(items[i], i) }; }\n      catch (e) { out[i] = { ok: false, error: e.message }; }\n    }\n  }));\n  return out;\n}\n\n\nconst route = $('Merge Session').first().json;\nif (!route.authorized) {\n  return [{ json: { chatId: route.chatId, empty: true,\n    text: '👋 Спершу підключіть акаунт «Сільпо» — інакше я не побачу ваш кошик.\\n\\nНатисніть /connect' }}];\n}\n\nconst mcp = createMcp(route.session);\nconst { shoppingCartId } = await mcp.call('silpo_get_my_shopping_cart', {});\nconst response = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId });\nconst cart = response.cart;\nconst items = cart.shipments.flatMap(s => s.products);\nconst money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n\nif (!items.length) {\n  return [{ json: { chatId: route.chatId, empty: true,\n    text: '🛒 Ваш кошик порожній.\\n\\nНаповніть його в застосунку «Сільпо» — і я перевірю, де можна зекономити.' }}];\n}\n\n// Telegram caps a message at 4096 characters.\nconst shown = items.slice(0, 30);\nconst lines = shown.map((item, i) =>\n  (i + 1) + '. ' + item.name + '\\n'\n  + '   ' + money(item.price) + (item.quantity > 1 ? ' × ' + item.quantity : '')\n  + (item.ratio ? '  ·  ' + item.ratio : '')\n  + (item.oldPrice ? '  🎁 було ' + money(item.oldPrice) : ''));\n\nlet text = '🛒 *Ваш кошик*\\n'\n  + items.length + ' товарів на *' + money(cart.calculation.total) + '*\\n\\n'\n  + lines.join('\\n');\n\nif (items.length > shown.length) {\n  text += '\\n\\n_…і ще ' + (items.length - shown.length) + ' позицій._';\n}\n\nconst discount = cart.calculation.subDiscount;\nif (discount > 0) {\n  text += '\\n\\n🎁 Знижок уже враховано: ' + money(discount);\n}\n\nconst loyalty = response.loyalty || {};\nif (loyalty.bonusAvailable > 0) {\n  text += '\\n💳 Балабонуси: ' + loyalty.bonusAvailable + ' грн';\n}\n\n// An expired slot also makes Silpo report every line as out of stock.\nconst slotBroken = (cart.calculation.validations || []).some(v => v.level === 'error' && v.type === 'timeslot');\nif (slotBroken) {\n  text += '\\n\\n⏰ _Слот доставки протух — оберіть новий у застосунку, інакше кошик не оформиться._';\n}\n\nreturn [{ json: { chatId: route.chatId, empty: false, text } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "read-cart",
+      "name": "Read Cart",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        960
+      ],
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "🔍 Оптимізувати кошик",
+                    "additionalFields": {
+                      "type": "callback_data",
+                      "callback_data": "optimize:"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-cart",
+      "name": "Send Cart",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        740,
+        960
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n// Never leak a stack trace to the customer — map failures to plain guidance.\nconst failure = $input.first().json;\nconst raw = String((failure.error && failure.error.message) || failure.message || '');\nconst route = $('Merge Session').first().json;\n\nlet text;\nif (raw.includes('SILPO_REAUTH_REQUIRED') || raw.includes('REAUTH')) {\n  text = '🔐 Доступ до акаунта «Сільпо» втратив силу.\\n\\nНатисніть /connect, щоб увійти знову.';\n} else if (raw.includes('SILPO_FORBIDDEN')) {\n  text = '⛔ Немає доступу до цієї операції у вашому акаунті «Сільпо».';\n} else if (raw.includes('SILPO_MCP_ERROR_429')) {\n  text = '⏳ Забагато запитів до «Сільпо». Зачекайте хвилину і спробуйте ще раз.';\n} else if (raw.includes('SILPO_MCP_ERROR_5') || raw.includes('SILPO_EMPTY_RESPONSE')) {\n  text = '🔧 Сервіс «Сільпо» тимчасово недоступний. Спробуйте за кілька хвилин.';\n} else if (raw.includes('TOKEN_ENCRYPTION_KEY')) {\n  text = '⚙️ Помилка конфігурації бота. Зверніться до адміністратора.';\n} else if (raw.includes('TOOL_ERROR')) {\n  text = '🛒 «Сільпо» не змогло виконати операцію з кошиком.\\n\\nПеревірте кошик у застосунку та спробуйте ще раз.';\n} else {\n  // Not a stack trace, but enough to identify the failure without digging\n  // through Executions. Unknown errors are the ones worth surfacing.\n  const hint = raw.replace(/\\s+/g, ' ').slice(0, 120);\n  text = '😔 Щось пішло не так. Спробуйте ще раз через /optimize.'\n    + (hint ? '\\n\\n_' + hint + '_' : '');\n}\nreturn [{ json: { chatId: route.chatId, text } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "handle-error",
+      "name": "Handle Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        960,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "plan_id",
+              "keyValue": "={{ $('Merge Session').first().json.planId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "status": "failed"
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "plan_id",
+              "displayName": "plan_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "cart_id",
+              "displayName": "cart_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "plan_json",
+              "displayName": "plan_json",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "original_total",
+              "displayName": "original_total",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "status",
+              "displayName": "status",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "release-plan",
+      "name": "Release Plan",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1400,
+        660
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-error",
+      "name": "Send Error",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1180,
+        660
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Telegram Trigger": {
+      "main": [
+        [
+          {
+            "node": "Route Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Route Request": {
+      "main": [
+        [
+          {
+            "node": "Load Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Session": {
+      "main": [
+        [
+          {
+            "node": "Merge Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge Session": {
+      "main": [
+        [
+          {
+            "node": "Switch Action",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch Action": {
+      "main": [
+        [
+          {
+            "node": "Is Authorized?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Auth URL",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Cancelled",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Plan Details",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Read Cart",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Load Plan For Toggle",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Update Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Help",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Auth URL": {
+      "main": [
+        [
+          {
+            "node": "Save OAuth State",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save OAuth State": {
+      "main": [
+        [
+          {
+            "node": "Send Login Link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Authorized?": {
+      "main": [
+        [
+          {
+            "node": "Send Progress",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ask To Connect",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Progress": {
+      "main": [
+        [
+          {
+            "node": "Optimize Cart",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Optimize Cart": {
+      "main": [
+        [
+          {
+            "node": "Build AI Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build AI Prompt": {
+      "main": [
+        [
+          {
+            "node": "Apply AI Decisions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply AI Decisions": {
+      "main": [
+        [
+          {
+            "node": "Save Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Plan": {
+      "main": [
+        [
+          {
+            "node": "Format Recommendation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Recommendation": {
+      "main": [
+        [
+          {
+            "node": "Send Recommendation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Blocklist": {
+      "main": [
+        [
+          {
+            "node": "Save Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Blocklist": {
+      "main": [
+        [
+          {
+            "node": "Send Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Plan For Toggle": {
+      "main": [
+        [
+          {
+            "node": "Toggle Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Toggle Selection": {
+      "main": [
+        [
+          {
+            "node": "Save Selection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save Selection": {
+      "main": [
+        [
+          {
+            "node": "Update Card",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Plan": {
+      "main": [
+        [
+          {
+            "node": "Validate Plan",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Plan": {
+      "main": [
+        [
+          {
+            "node": "Plan Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Plan Valid?": {
+      "main": [
+        [
+          {
+            "node": "Claim Plan",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Plan Invalid",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Claim Plan": {
+      "main": [
+        [
+          {
+            "node": "Send Applying",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Applying": {
+      "main": [
+        [
+          {
+            "node": "Apply Changes",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Apply Changes": {
+      "main": [
+        [
+          {
+            "node": "Mark Plan Applied",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Release Plan",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Mark Plan Applied": {
+      "main": [
+        [
+          {
+            "node": "Format Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Result": {
+      "main": [
+        [
+          {
+            "node": "Send Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Plan Details": {
+      "main": [
+        [
+          {
+            "node": "Format Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format Details": {
+      "main": [
+        [
+          {
+            "node": "Send Details",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Cart": {
+      "main": [
+        [
+          {
+            "node": "Send Cart",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Handle Error": {
+      "main": [
+        [
+          {
+            "node": "Send Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "pinData": {},
+  "meta": {
+    "instanceId": "silpo-optimizer"
+  },
+  "tags": [
+    {
+      "name": "silpo"
+    }
+  ]
+}
