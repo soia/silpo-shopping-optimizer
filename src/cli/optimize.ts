@@ -21,7 +21,7 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONCURRENCY = 3;
 const startedAt = Date.now();
 
-const money = (n: number) => `${n.toFixed(2).replace('.', ',')} UAH`;
+const money = (n: number) => `${Number(n).toFixed(2)} UAH`;
 
 /* 1. Cart */
 console.log('\nAnalyzing cart…\n');
@@ -194,11 +194,12 @@ const plan = applyDecisions(rawPlan, ranking.decisions);
 
 /* 6. Report */
 const summary = plan.summary;
+const amount = (n: number) => n.toFixed(2).padStart(9);
 console.log(`\n${'='.repeat(72)}`);
-console.log(`Before:   ${money(summary.originalTotal)}`);
-console.log(`After:    ${money(summary.optimizedTotal)}`);
-console.log(`SAVING:   ${money(summary.saving)}  (${summary.savingPct}%)`);
-console.log(`${summary.itemsAnalyzed} items analyzed · ${summary.replacementsFound} replacements · ${summary.promotionsUsed} on promotion`);
+console.log(`Before   ${amount(summary.originalTotal)} UAH`);
+console.log(`After    ${amount(summary.optimizedTotal)} UAH`);
+console.log(`Saving   ${amount(summary.saving)} UAH   ${summary.savingPct}%`);
+console.log(`\n${summary.itemsAnalyzed} items · ${summary.replacementsFound} replacements · ${summary.promotionsUsed} on promotion`);
 if (summary.bonusAvailable > 0) {
   console.log(`Loyalty bonuses: ${summary.bonusAvailable} (potential, excluded from the saving)`);
 }
@@ -245,7 +246,7 @@ console.log('Per-item diagnostics:\n');
 for (const d of diagnostics) {
   console.log(`  ${String(d.considered).padStart(3)} candidates → ${d.passed} kept   ${d.item.name.slice(0, 44)}`);
 }
-console.log(`\nMCP: ${stats.calls} calls · ${stats.retries} retries · ${stats.refreshes} refreshes · ${((Date.now() - startedAt) / 1000).toFixed(1)}s\n`);
+console.log(`\n${stats.calls} MCP calls · ${stats.retries} retries · ${stats.refreshes} refreshes · ${((Date.now() - startedAt) / 1000).toFixed(1)} s\n`);
 
 if (process.argv.includes('--json')) {
   mkdirSync(resolve(ROOT, '.secrets'), { recursive: true });

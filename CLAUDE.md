@@ -124,7 +124,7 @@ working alternative (`verifySize`) was added, and the deviation was reported.
 Related: do not change the ranking formula from `docs/brief.md` without
 proposing it first.
 
-## 9. Secrets
+## 10. Secrets
 
 - Everything sensitive lives in `.secrets/` (gitignored, mode `0600`).
 - Never write a token, key or connection string into source, docs, or the
@@ -138,7 +138,7 @@ proposing it first.
   `telegram_user_id`, and one shared Silpo account for all users is not
   acceptable.
 
-## 10. Telegram
+## 11. Telegram
 
 - The n8n Telegram node renders a keyboard declared in its parameters, so it
   cannot produce one button per replacement. The selection card and its updates
@@ -150,7 +150,7 @@ proposing it first.
   message arrives without buttons.
 - Set `appendAttribution: false`, or every message carries an n8n footer.
 
-## 11. Language
+## 12. Language
 
 - Code, comments, identifiers, docs, log output: **English**.
 - Strings the customer reads in Telegram, and the model prompt that generates
@@ -163,7 +163,7 @@ proposing it first.
   spirit of Silpo's printed ones. Silpo's actual receipt texts are their own
   authors' work — do not copy them in.
 
-## 12. TypeScript, no build step
+## 13. TypeScript, no build step
 
 Node 22 runs `.ts` directly via `--experimental-strip-types`. Consequences:
 
@@ -173,7 +173,7 @@ Node 22 runs `.ts` directly via `--experimental-strip-types`. Consequences:
 - `strict` is on and `npm run typecheck` must stay clean.
 - Runtime dependencies: none. Keep it that way; `typescript` is dev-only.
 
-## 13. Storage is n8n data tables
+## 14. Storage is n8n data tables
 
 There is no external database. Three tables live inside n8n and their ids are
 compiled into `TABLES` in `src/workflow/build.ts`.
@@ -191,7 +191,7 @@ Consequences to respect:
   mapper will not bind the fields.
 - Recreating a table changes its id — update `TABLES` and rebuild.
 
-## 14. Rate limits and resilience
+## 15. Rate limits and resilience
 
 Silpo rate-limits per user. Any new MCP fan-out must:
 

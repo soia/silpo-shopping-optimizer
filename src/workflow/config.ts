@@ -8,12 +8,14 @@
  * ```json
  * {
  *   "baseUrl": "https://your-instance.app.n8n.cloud",
- *   "tables": { "oauthState": "...", "sessions": "...", "plans": "..." }
+ *   "tables": { "oauthState": "...", "sessions": "...", "plans": "..." },
+ *   "telegramCredentialId": "..."
  * }
  * ```
  *
  * Table ids come from n8n (Overview → Data tables) and are visible in the URL of
- * each table. Recreating a table changes its id.
+ * each table. Recreating a table changes its id. The credential id is likewise
+ * the last path segment when the Telegram credential is open.
  */
 
 import { existsSync, readFileSync } from 'node:fs';
@@ -31,6 +33,14 @@ export interface DeploymentConfig {
     sessions: string;
     plans: string;
   };
+  /**
+   * Id of the Telegram credential in the target instance.
+   *
+   * n8n resolves a node's credential by id first and only then by name, so an
+   * id that does not exist leaves all fourteen Telegram nodes unbound — the
+   * workflow then refuses to publish. Copy it from the credential's URL in n8n.
+   */
+  telegramCredentialId: string;
 }
 
 export const PLACEHOLDERS: DeploymentConfig = {
@@ -40,6 +50,7 @@ export const PLACEHOLDERS: DeploymentConfig = {
     sessions: 'REPLACE_WITH_SESSIONS_TABLE_ID',
     plans: 'REPLACE_WITH_PLANS_TABLE_ID',
   },
+  telegramCredentialId: 'SILPO_TG',
 };
 
 function load(): DeploymentConfig {
@@ -48,6 +59,7 @@ function load(): DeploymentConfig {
   return {
     baseUrl: override.baseUrl ?? PLACEHOLDERS.baseUrl,
     tables: { ...PLACEHOLDERS.tables, ...(override.tables ?? {}) },
+    telegramCredentialId: override.telegramCredentialId ?? PLACEHOLDERS.telegramCredentialId,
   };
 }
 
@@ -68,5 +80,6 @@ export function personalise(json: string): string {
   for (const key of Object.keys(PLACEHOLDERS.tables) as Array<keyof DeploymentConfig['tables']>) {
     out = out.split(PLACEHOLDERS.tables[key]).join(deployment.tables[key]);
   }
+  out = out.split(PLACEHOLDERS.telegramCredentialId).join(deployment.telegramCredentialId);
   return out;
 }

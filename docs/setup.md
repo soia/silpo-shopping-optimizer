@@ -76,7 +76,8 @@ TTL checks use `createdAt`.
 > ```json
 > {
 >   "baseUrl": "https://your-instance.app.n8n.cloud",
->   "tables": { "oauthState": "...", "sessions": "...", "plans": "..." }
+>   "tables": { "oauthState": "...", "sessions": "...", "plans": "..." },
+>   "telegramCredentialId": "..."
 > }
 > ```
 >
@@ -145,9 +146,12 @@ go through the Bot API directly, and a Code node cannot read a credential.
 Pick **Global**, not Personal: the workflow reads the value on every execution,
 whoever triggered it.
 
-The Code nodes read these through `$vars` only. `$env` is never touched: n8n
-Cloud defines the object but throws *"access to env vars denied"* on any
-property read, so even a `typeof` guard does not help.
+The Code nodes read `$vars` first and fall back to `$env` — each in its own
+`try`/`catch`, because n8n Cloud defines `$env` but throws *"access to env vars
+denied"* on any property read, so one shared guard would swallow the `$vars`
+value too. On Cloud only `$vars` ever answers; the `$env` branch exists for
+self-hosted Community, where Variables are a licensed feature but real
+environment variables are available.
 
 The instance URL is compiled in, so only the encryption key has to be created.
 If the instance moves, either add `N8N_BASE_URL` or change `DEFAULT_BASE_URL`
@@ -168,6 +172,13 @@ n8n → Credentials → + Add credential. The names must match the workflow JSON
 
 One credential is all the current build needs. Storage is n8n's own data tables,
 and the Anthropic node is not in the workflow yet (step 5).
+
+**Create it before importing, and put its id in `.secrets/n8n.json`.** n8n binds
+a node's credential by id first and falls back to the name only afterwards, so a
+credential id that does not exist in the target instance leaves all fourteen
+Telegram nodes unbound — and a workflow with an unbound node refuses to publish,
+with the Publish button greyed out rather than any explanation. The id is the
+last segment of the URL while the credential is open.
 
 ---
 
@@ -304,6 +315,68 @@ again. Silpo access tokens last 30 days, so this should be rare.
 
 **Saving is 0 UAH.** A legitimate outcome: nothing in the cart has a cheaper
 equivalent that preserves the purchase. Branded items give a better demo.
+
+---
+
+## Moving off n8n Cloud
+
+n8n Community Edition is free to self-host, and the bot needs exactly one change
+to run on it:
+
+| Requirement | Community Edition | Consequence |
+|---|---|---|
+| Data tables | **available** — rolled out to all plans in v1.113 | storage moves as-is; only the table ids change |
+| Variables (`$vars`) | **not available** — "Custom Variables" is a paid feature | the two secrets come from `$env` instead |
+| A public HTTPS URL | your own concern | needed for the Telegram webhook **and** the OAuth `redirect_uri` |
+
+Data tables are not a blocker and no storage rewrite is involved. n8n's own
+backing database (SQLite by default, Postgres optionally) is a separate concern
+from the data tables feature — switching it is about durability, not about
+whether this bot works.
+
+Variables are the one real gap. The Code nodes fall back to `$env`, so
+`TOKEN_ENCRYPTION_KEY` and `TELEGRAM_BOT_TOKEN` are passed to the container
+instead of being created in the UI. **`$env` access is blocked by default** — as
+of n8n 2.0 `N8N_BLOCK_ENV_ACCESS_IN_NODE` defaults to `true`, so it has to be set
+to `false` explicitly or every Code node reports a missing key.
+
+A ready compose stack — n8n behind Caddy, with TLS obtained automatically — is
+in [`deploy/`](../deploy/), along with a `bootstrap.sh` that installs Docker,
+creates swap and opens the host firewall:
+
+```bash
+cd deploy
+./bootstrap.sh
+cp .env.example .env && nano .env
+docker compose up -d
+```
+
+Free hosts that fit: **Oracle Cloud Always Free** (`VM.Standard.E2.1.Micro`, 1 GB
+— note the Always Free allocation is restricted to one availability domain, and
+the larger Ampere A1 shape is frequently out of capacity) or **Google Cloud
+e2-micro** (1 GB, always free, no capacity lottery). A laptop behind a
+`cloudflared` tunnel works for a one-off test, but its hostname changes on every
+restart, which invalidates the `redirect_uri`.
+
+A laptop behind a tunnel is fine for a demo but sleeps; an always-free VPS
+(Oracle Cloud Always Free, for instance) is the durable version. `WEBHOOK_URL`
+must be the public hostname — with anything else, neither Telegram nor Silpo can
+reach the instance.
+
+Self-hosted data tables default to a 200 MiB cap per instance, raised with
+`N8N_DATA_TABLES_MAX_SIZE_BYTES`. This bot stores sessions, short-lived OAuth
+state and 30-minute plans, so the default is not close to binding.
+
+Then, on the new instance:
+
+1. Recreate the three data tables — **new ids**.
+2. Put the new `baseUrl` and ids in `.secrets/n8n.json`, `npm run build:workflows`.
+3. Import from `.secrets/workflows/`, recreate the Telegram credential, publish both.
+4. Call `deleteWebhook` on the old Cloud instance first, or Telegram keeps
+   delivering there.
+
+The `redirect_uri` changes with the hostname, so the first `/connect` after the
+move is the test that matters.
 
 ---
 

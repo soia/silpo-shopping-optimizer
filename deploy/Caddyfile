@@ -1,0 +1,19 @@
+# Caddy obtains and renews the certificate itself; there is no certbot step and
+# nothing to schedule. The only prerequisite is that DOMAIN already resolves to
+# this host and ports 80 and 443 are reachable from the internet.
+
+{$DOMAIN} {
+	reverse_proxy n8n:5678 {
+		# n8n's editor uses websockets for live execution updates; without the
+		# upgrade headers the UI loads but never shows a running workflow.
+		header_up Host {host}
+		header_up X-Real-IP {remote_host}
+	}
+
+	encode gzip
+
+	log {
+		output stdout
+		format console
+	}
+}

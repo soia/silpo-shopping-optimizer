@@ -21,12 +21,13 @@ quietly downgraded to a regular one.
 **Cheaper is not the goal. Preserving the purchase is.**
 
 ```
-Before:   1042,30 UAH
-After:      945,49 UAH
-SAVING:      96,81 UAH  (9.3%)
+Before     1042.30 UAH
+After       945.49 UAH
+────────────────────────
+Saving       96.81 UAH   9.3%
 
-14 items analyzed · 5 replacements · 4 on promotion
-MCP: 22 calls · 0 retries · 2.1s
+14 items · 5 replacements · 4 on promotion
+22 MCP calls · 0 retries · 2.1 s
 ```
 
 <sub>Real numbers from a real cart on 2026-08-12 — not a mockup. See [engine-findings.md](docs/engine-findings.md).</sub>

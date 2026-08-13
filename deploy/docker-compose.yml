@@ -1,0 +1,94 @@
+# Self-hosted n8n for the Silpo bot: n8n behind Caddy, which obtains and renews
+# the TLS certificate on its own.
+#
+# Sized for a 1 GB Always Free box (Oracle VM.Standard.E2.1.Micro, GCP
+# e2-micro). See README.md in this directory - the swap file is not optional at
+# that size.
+#
+# Values come from .env in this directory; copy .env.example and fill it in.
+
+services:
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      # 80 is required even though the bot only uses 443: Caddy answers the
+      # ACME HTTP challenge there, and without it no certificate is ever issued.
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    environment:
+      DOMAIN: ${DOMAIN:?set DOMAIN in .env}
+    depends_on:
+      - n8n
+
+  n8n:
+    image: docker.n8n.io/n8nio/n8n:latest
+    restart: unless-stopped
+    # No published ports: Caddy reaches it over the compose network, so n8n is
+    # not exposed directly even if the firewall is misconfigured.
+    expose:
+      - "5678"
+    environment:
+      # --- public identity -------------------------------------------------
+      # All three must agree with the certificate Caddy holds, or the Telegram
+      # webhook registers against a URL that does not resolve.
+      N8N_HOST: ${DOMAIN:?set DOMAIN in .env}
+      N8N_PROTOCOL: https
+      N8N_PORT: 5678
+      WEBHOOK_URL: https://${DOMAIN}/
+      N8N_EDITOR_BASE_URL: https://${DOMAIN}/
+      # n8n sits behind exactly one reverse proxy; without this it trusts the
+      # wrong client IP and rate limiting misbehaves.
+      N8N_PROXY_HOPS: 1
+
+      # --- what this project needs ----------------------------------------
+      # Community Edition has no Variables feature, so the Code nodes read
+      # their configuration from the environment instead. n8n 2.0 blocks that
+      # by default: without the next line every Code node reports a missing
+      # key and the bot silently does nothing.
+      N8N_BLOCK_ENV_ACCESS_IN_NODE: "false"
+
+      # The Code node sandbox blocks every built-in module by default on
+      # self-hosted; n8n Cloud allowed crypto, which is why this never had to be
+      # set before. Token encryption (AES-256-GCM) and the PKCE verifier both
+      # require it, so without this line /connect fails at the first node.
+      NODE_FUNCTION_ALLOW_BUILTIN: crypto
+
+      # Read by readVar() in the generated Code nodes.
+      TOKEN_ENCRYPTION_KEY: ${TOKEN_ENCRYPTION_KEY:?set TOKEN_ENCRYPTION_KEY in .env}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:?set TELEGRAM_BOT_TOKEN in .env}
+      # Overrides the base URL compiled into the workflows, so moving host is a
+      # restart rather than a rebuild.
+      N8N_BASE_URL: https://${DOMAIN}/
+
+      # --- n8n's own credential encryption ---------------------------------
+      # NOT the same thing as TOKEN_ENCRYPTION_KEY above. This one encrypts the
+      # Telegram credential inside n8n; TOKEN_ENCRYPTION_KEY encrypts Silpo
+      # tokens inside our data tables. Set explicitly so that recreating the
+      # volume cannot silently orphan every stored credential.
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?set N8N_ENCRYPTION_KEY in .env}
+
+      # --- memory ------------------------------------------------------------
+      # Defaults suit a 1 GB always-free box. On a 4 GB VPS raise it in .env:
+      # N8N_MAX_OLD_SPACE=3072 - leaving it at 768 wastes most of the machine.
+      NODE_OPTIONS: --max-old-space-size=${N8N_MAX_OLD_SPACE:-768}
+      EXECUTIONS_DATA_PRUNE: "true"
+      # Community Edition keeps one day of workflow history regardless; there is
+      # nothing to gain from hoarding execution data on a small disk.
+      EXECUTIONS_DATA_MAX_AGE: 72
+      EXECUTIONS_DATA_PRUNE_MAX_COUNT: 5000
+
+      GENERIC_TIMEZONE: ${TZ:-Europe/Kyiv}
+      TZ: ${TZ:-Europe/Kyiv}
+    volumes:
+      # Holds the SQLite database, and with it the three data tables.
+      - n8n_data:/home/node/.n8n
+
+volumes:
+  n8n_data:
+  caddy_data:
+  caddy_config:

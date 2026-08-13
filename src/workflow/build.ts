@@ -400,12 +400,21 @@ function telegramApiUrl(method) {
  * does not protect against it. Variables are the only portable channel.
  */
 const READ_VAR = `
+// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines
+// $env but throws "access to env vars denied" on any property read, so a shared
+// guard would lose the $vars value. Self-hosted Community has no Variables
+// feature (it is licensed) but can set real environment variables, provided
+// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.
 function readVar(name) {
   try {
-    return (typeof $vars !== 'undefined' && $vars[name]) || null;
-  } catch (e) {
-    return null;
-  }
+    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;
+    if (v) return v;
+  } catch (e) { /* Variables unavailable - fall through to env */ }
+  try {
+    const v = (typeof $env !== 'undefined' && $env[name]) || null;
+    if (v) return v;
+  } catch (e) { /* env access denied - n8n Cloud */ }
+  return null;
 }
 `;
 

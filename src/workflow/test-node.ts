@@ -59,7 +59,7 @@ const run = new Function('$', '$env', '$input', 'require', 'fetch', `return (asy
 const output = (await run($, $env, $input, createRequire(import.meta.url), fetch)) as Array<{ json: any }>;
 
 const result = output[0].json;
-const money = (n: number) => `${Number(n).toFixed(2).replace('.', ',')} UAH`;
+const money = (n: number) => `${Number(n).toFixed(2)} UAH`;
 
 if (result.empty) {
   console.log('Cart is empty');

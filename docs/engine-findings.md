@@ -8,15 +8,16 @@ store, on 2026-08-12.
 ## Result
 
 ```
-Found 14 items totalling 1051,30 UAH
+Found 14 items totalling 1051.30 UAH
 promotions: 9 · coupons: 0 · bonuses: 34.24
 
-Before:   1042,30 UAH
-After:      945,49 UAH
-SAVING:      96,81 UAH  (9.29%)
+Before     1042.30 UAH
+After       945.49 UAH
+────────────────────────
+Saving       96.81 UAH   9.29%
 
-14 items analyzed · 5 replacements · 4 on promotion
-MCP: 22 calls · 0 retries · 2.1s
+14 items · 5 replacements · 4 on promotion
+22 MCP calls · 0 retries · 2.1 s
 ```
 
 22 calls for 14 items in about two seconds, with no rate limiting hit at
