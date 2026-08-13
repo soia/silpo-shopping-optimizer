@@ -114,6 +114,24 @@ Flow:
 9. On 401 the refresh token is used; if that fails the guest re-connects
 ```
 
+### Disconnecting
+
+`/logout` asks for confirmation, and only the button clears anything. The
+confirmation edits the prompt in place, so the keyboard disappears before the
+deletion runs and the tap cannot be repeated.
+
+Confirming wipes `client_id`, both encrypted tokens and `expires_at` from the
+session row and deletes every plan belonging to that Telegram user. The row
+itself survives because it also carries the brand blocklist, which is a chat
+preference rather than an account one.
+
+The plans go because `Validate Plan` only checks that the tapper owns the plan:
+a plan computed for the previous account would otherwise still be applicable
+against the next account's cart.
+
+Silpo exposes no revocation endpoint, so this removes our stored copy of the
+token rather than invalidating it at the provider.
+
 ### Why not the built-in n8n MCP node
 
 The MCP Client node holds one static credential per workflow, which means one

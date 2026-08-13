@@ -68,6 +68,7 @@ interface N8nNode {
   credentials?: Record<string, { id: string; name: string }>;
   onError?: string;
   alwaysOutputData?: boolean;
+  executeOnce?: boolean;
 }
 
 interface NodeOptions {
@@ -77,6 +78,13 @@ interface NodeOptions {
   credentials?: Record<string, { id: string; name: string }>;
   onError?: string;
   alwaysOutputData?: boolean;
+  /**
+   * Run the node once regardless of how many items arrive.
+   *
+   * Data Table operations emit one item per affected row, so anything sending a
+   * message downstream of a multi-row delete otherwise sends one per row.
+   */
+  executeOnce?: boolean;
 }
 
 const TELEGRAM_CREDENTIALS = { telegramApi: { id: 'SILPO_TG', name: 'Silpo Bot' } };
@@ -156,6 +164,7 @@ function makeNode(name: string, type: string, parameters: Record<string, unknown
     ...(options.credentials ? { credentials: options.credentials } : {}),
     ...(options.onError ? { onError: options.onError } : {}),
     ...(options.alwaysOutputData ? { alwaysOutputData: true } : {}),
+    ...(options.executeOnce ? { executeOnce: true } : {}),
   };
 }
 
@@ -380,14 +389,6 @@ function buildSelectionCard(plan, selected) {
 
   return { text, keyboard };
 }
-
-function telegramApiUrl(method) {
-  const token = readVar('TELEGRAM_BOT_TOKEN');
-  if (!token) {
-    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');
-  }
-  return 'https://api.telegram.org/bot' + token + '/' + method;
-}
 `;
 
 /* -------------------------------------------------- shared Code-node runtime */
@@ -415,6 +416,22 @@ function readVar(name) {
     if (v) return v;
   } catch (e) { /* env access denied - n8n Cloud */ }
   return null;
+}
+`;
+
+/**
+ * Bot API endpoint builder — needs READ_VAR in the same node.
+ *
+ * Used wherever a message cannot go through the Telegram node: keyboards built
+ * in code, message edits, and callback acknowledgements.
+ */
+const TELEGRAM_API = `
+function telegramApiUrl(method) {
+  const token = readVar('TELEGRAM_BOT_TOKEN');
+  if (!token) {
+    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');
+  }
+  return 'https://api.telegram.org/bot' + token + '/' + method;
 }
 `;
 
@@ -716,13 +733,23 @@ for (const item of $input.all()) {
 
   let toggleIndex = null;
   let brandArg = null;
+  // Disconnecting is confirmed by a tap, so the same action arrives twice: once
+  // as the command, once as logout:yes. Only the second one may clear anything.
+  let logoutConfirm = false;
+  let logoutCancel = false;
 
   if (callbackData) {
     // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>
+    // | logout:yes
     const parts = callbackData.split(':');
     action = parts[0] === 't' ? 'toggle' : parts[0];
     planId = parts[1] || null;
     if (action === 'toggle') toggleIndex = Number(parts[2]);
+    if (action === 'logout') {
+      planId = null;
+      logoutConfirm = parts[1] === 'yes';
+      logoutCancel = parts[1] === 'no';
+    }
   } else if (text.startsWith('/unblock')) {
     // Sliced rather than matched: a regex literal here would lose its escapes
     // passing through the generator's template literal.
@@ -737,12 +764,15 @@ for (const item of $input.all()) {
   else if (text.startsWith('/connect')) action = 'connect';
   else if (text.startsWith('/optimize') || text.includes('Оптимізувати')) action = 'optimize';
   else if (text.startsWith('/cart')) action = 'cart';
+  else if (text.startsWith('/logout') || text.startsWith('/disconnect')) action = 'logout';
 
   items.push({ json: {
     action,
     planId,
     toggleIndex,
     brandArg,
+    logoutConfirm,
+    logoutCancel,
     chatId: message && message.chat && message.chat.id,
     telegramUserId: from && from.id,
     callbackQueryId: (update.callback_query && update.callback_query.id) || null,
@@ -814,6 +844,7 @@ return routed.map(r => {
             { conditions: stringCondition('block'), outputKey: 'block' },
             { conditions: stringCondition('unblock'), outputKey: 'unblock' },
             { conditions: stringCondition('blocked'), outputKey: 'blocked' },
+            { conditions: stringCondition('logout'), outputKey: 'logout' },
           ],
         },
         options: { fallbackOutput: 'extra', renameFallbackOutput: 'other' },
@@ -1145,6 +1176,39 @@ return [{ json: {
   );
   link('Send Progress', 'Optimize Cart');
 
+  // An empty cart has no plan to build: the AI call has nothing to judge and
+  // `plan.summary` does not exist, so the downstream nodes used to throw and the
+  // progress message stayed on screen as the last thing the guest saw.
+  nodes.push(
+    makeNode(
+      'Cart Is Empty?',
+      'n8n-nodes-base.if',
+      {
+        conditions: {
+          options: { caseSensitive: true, version: 2 },
+          combinator: 'and',
+          conditions: [{ id: 'empty', operator: { type: 'boolean', operation: 'true', singleValue: true }, leftValue: '={{ $json.empty === true }}', rightValue: '' }],
+        },
+        options: {},
+      },
+      { typeVersion: 2.2, x: 1180, y: -80 },
+    ),
+  );
+  link('Optimize Cart', 'Cart Is Empty?', 0);
+
+  nodes.push(
+    telegramNode(
+      'Send Empty Cart',
+      {
+        chatId: '={{ $json.chatId }}',
+        text: '🛒 Ваш кошик порожній — оптимізувати нічого.\n\nНаповніть його в застосунку «Сільпо» і надішліть /optimize ще раз.',
+        additionalFields: { appendAttribution: false },
+      },
+      { x: 1400, y: 60 },
+    ),
+  );
+  link('Cart Is Empty?', 'Send Empty Cart', 0);
+
   nodes.push(
     codeNode(
       'Build AI Prompt',
@@ -1191,7 +1255,7 @@ return [{ json: { ...plan,
       { x: 1180, y: -240 },
     ),
   );
-  link('Optimize Cart', 'Build AI Prompt', 0);
+  link('Cart Is Empty?', 'Build AI Prompt', 1);
 
   if (AI_SEMANTIC_CHECK) {
     nodes.push(
@@ -1366,6 +1430,7 @@ return [{ json: { ...plan,
       'Format Recommendation',
       `
 ${READ_VAR}
+${TELEGRAM_API}
 ${SELECTION_CARD}
 const plan = $('Apply AI Decisions').first().json;
 // Everything is selected to begin with; the guest unticks what they do not want.
@@ -1466,7 +1531,9 @@ return [{ json: {
         filters: [{ keyName: 'telegram_user_id', keyValue: '={{ $json.telegramUserId }}' }],
         columns: { blocked_brands: '={{ $json.blockedValue }}' },
       },
-      { x: 740, y: 1280 },
+      // Same trap as the logout branch: a guest who never connected has no
+      // session row, so the update touches nothing and the reply would be lost.
+      { x: 740, y: 1280, alwaysOutputData: true },
     ),
   );
   link('Update Blocklist', 'Save Blocklist');
@@ -1484,6 +1551,151 @@ return [{ json: {
   );
   link('Save Blocklist', 'Send Blocklist');
 
+  /* --- logout branch: disconnect the Silpo account --------------------- */
+  nodes.push(
+    codeNode(
+      'Prepare Logout',
+      `
+${READ_VAR}
+${TELEGRAM_API}
+// Two steps on purpose: /logout only asks, the button clears. Both replies are
+// built here so the branch needs a single outgoing call before the tables are
+// touched.
+//
+// Confirming edits the prompt instead of sending a new message: that removes the
+// keyboard, so the tap cannot be repeated while the deletion runs.
+const route = $('Merge Session').first().json;
+const base = { chatId: route.chatId, telegramUserId: route.telegramUserId };
+
+if (route.logoutCancel) {
+  return [{ json: { ...base, confirmed: false, url: telegramApiUrl('editMessageText'), body: {
+    chat_id: route.chatId,
+    message_id: route.messageId,
+    text: '❌ Скасовано. Акаунт залишився підключеним.',
+  }}}];
+}
+
+if (!route.authorized) {
+  return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {
+    chat_id: route.chatId,
+    text: 'Акаунт «Сільпо» не підключений.\\n\\nЩоб підключити — /connect',
+  }}}];
+}
+
+if (route.logoutConfirm) {
+  return [{ json: { ...base, confirmed: true, url: telegramApiUrl('editMessageText'), body: {
+    chat_id: route.chatId,
+    message_id: route.messageId,
+    text: '🚪 Від’єдную акаунт...',
+  }}}];
+}
+
+return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {
+  chat_id: route.chatId,
+  parse_mode: 'Markdown',
+  text: '🚪 *Від’єднати акаунт «Сільпо»?*\\n\\nЯ видалю збережений доступ і всі підготовлені плани. Ваш кошик і замовлення в «Сільпо» залишаться без змін.\\n\\nПісля цього можна підключити інший акаунт через /connect.\\n\\n_Список заблокованих марок збережеться._',
+  reply_markup: { inline_keyboard: [[
+    { text: '🚪 Так, від’єднати', callback_data: 'logout:yes' },
+    { text: '❌ Ні', callback_data: 'logout:no' },
+  ]] },
+}}}];
+`,
+      { x: 520, y: 1440 },
+    ),
+  );
+  link('Switch Action', 'Prepare Logout', 10);
+
+  nodes.push(
+    makeNode(
+      'Send Logout Reply',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
+      },
+      { typeVersion: 4.2, x: 740, y: 1440, onError: 'continueRegularOutput' },
+    ),
+  );
+  link('Prepare Logout', 'Send Logout Reply');
+
+  nodes.push(
+    makeNode(
+      'Logout Confirmed?',
+      'n8n-nodes-base.if',
+      {
+        conditions: {
+          options: { caseSensitive: true, version: 2 },
+          combinator: 'and',
+          conditions: [{
+            id: 'confirmed',
+            operator: { type: 'boolean', operation: 'true', singleValue: true },
+            leftValue: "={{ $('Prepare Logout').first().json.confirmed }}",
+            rightValue: '',
+          }],
+        },
+        options: {},
+      },
+      { typeVersion: 2.2, x: 960, y: 1440 },
+    ),
+  );
+  link('Send Logout Reply', 'Logout Confirmed?');
+
+  // The row survives with its blocklist; only the credentials are wiped. Keeping
+  // it also keeps `Save Blocklist` working, which updates an existing row.
+  nodes.push(
+    dataTableNode(
+      'Clear Session',
+      {
+        operation: 'update',
+        table: TABLES.sessions,
+        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Prepare Logout').first().json.telegramUserId }}" }],
+        columns: { access_token_enc: '', refresh_token_enc: '', client_id: '', expires_at: '' },
+      },
+      // Row-returning writes emit one item per affected row and nothing at all
+      // when they affect none, which would silently strand the rest of the
+      // branch. alwaysOutputData keeps one empty item flowing.
+      { x: 1180, y: 1440, alwaysOutputData: true },
+    ),
+  );
+  link('Logout Confirmed?', 'Clear Session', 0);
+
+  // Plans outlive the session they were built from, and `Validate Plan` only
+  // checks that the tapper owns the plan. Without this, a plan computed for the
+  // previous account would still be applicable against the next one's cart.
+  nodes.push(
+    dataTableNode(
+      'Delete Plans',
+      {
+        operation: 'deleteRows',
+        table: TABLES.plans,
+        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Prepare Logout').first().json.telegramUserId }}" }],
+      },
+      // A guest with no stored plans deletes nothing, so without this the
+      // confirmation never reaches them — which is exactly what happened.
+      { x: 1400, y: 1440, alwaysOutputData: true },
+    ),
+  );
+  link('Clear Session', 'Delete Plans');
+
+  nodes.push(
+    telegramNode(
+      'Send Logged Out',
+      {
+        chatId: "={{ $('Prepare Logout').first().json.chatId }}",
+        text: '✅ Акаунт від’єднано.\n\nЗбережений доступ видалено, підготовлені плани стерто. Кошик у «Сільпо» не змінювався.\n\nЩоб підключити інший акаунт — /connect',
+        additionalFields: { appendAttribution: false },
+      },
+      // Delete Plans emits one item per deleted row; without this the guest gets
+      // one confirmation per plan they had stored.
+      { x: 1620, y: 1440, executeOnce: true },
+    ),
+  );
+  link('Delete Plans', 'Send Logged Out');
+
   /* --- toggle branch: tick a replacement on or off --------------------- */
   nodes.push(
     dataTableNode(
@@ -1499,6 +1711,7 @@ return [{ json: {
       'Toggle Selection',
       `
 ${READ_VAR}
+${TELEGRAM_API}
 ${SELECTION_CARD}
 const route = $('Merge Session').first().json;
 const rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);
@@ -2013,17 +2226,41 @@ return [{ json: { chatId: result.chatId, text } }];
   link('Switch Action', 'Send Cancelled', 3);
 
   nodes.push(
+    codeNode(
+      'Build Help',
+      `
+// The command list reflects what the guest can actually do right now: /logout
+// makes no sense before an account is connected, so it only appears afterwards.
+const route = $('Merge Session').first().json;
+
+let text = '👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\\n\\n*Основне*\\n';
+text += route.authorized
+  ? '/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n/logout — від’єднати акаунт (щоб підключити інший)\\n'
+  : '/connect — підключити акаунт Сільпо\\n/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n';
+text += '\\n*Якщо якусь марку не хочете бачити в замінах*\\n/blocked — ваш список винятків\\n/block + назва марки — не пропонувати її\\n/unblock + назва марки — повернути\\n\\n';
+text += '_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\\n\\n';
+text += 'Я шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.';
+
+return [{ json: { chatId: route.chatId, text } }];
+`,
+      { x: 520, y: 660 },
+    ),
+  );
+  // The fallback output sits after every rule, so it shifts whenever one is added.
+  link('Switch Action', 'Build Help', 11);
+
+  nodes.push(
     telegramNode(
       'Send Help',
       {
         chatId: '={{ $json.chatId }}',
-        text: '👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\n\n*Основне*\n/connect — підключити акаунт Сільпо\n/cart — показати кошик\n/optimize — знайти, де можна зекономити\n\n*Якщо якусь марку не хочете бачити в замінах*\n/blocked — ваш список винятків\n/block + назва марки — не пропонувати її\n/unblock + назва марки — повернути\n\n_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\n\nЯ шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.',
-        additionalFields: { appendAttribution: false },
+        text: '={{ $json.text }}',
+        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
       },
-      { x: 520, y: 660 },
+      { x: 740, y: 660 },
     ),
   );
-  link('Switch Action', 'Send Help', 10);
+  link('Build Help', 'Send Help');
 
   nodes.push(
     dataTableNode(
@@ -2180,6 +2417,39 @@ return [{ json: { chatId: route.chatId, empty: false, text } }];
   link('Switch Action', 'Read Cart', 5);
   link('Read Cart', 'Handle Error', 1);
 
+  // «Оптимізувати кошик» leads nowhere when there is nothing in the cart — and
+  // the same output carries the "connect your account first" message. The node's
+  // keyboard is fixed at design time, so the two cases need two nodes.
+  nodes.push(
+    makeNode(
+      'Cart View Empty?',
+      'n8n-nodes-base.if',
+      {
+        conditions: {
+          options: { caseSensitive: true, version: 2 },
+          combinator: 'and',
+          conditions: [{ id: 'empty', operator: { type: 'boolean', operation: 'true', singleValue: true }, leftValue: '={{ $json.empty === true }}', rightValue: '' }],
+        },
+        options: {},
+      },
+      { typeVersion: 2.2, x: 740, y: 960 },
+    ),
+  );
+  link('Read Cart', 'Cart View Empty?', 0);
+
+  nodes.push(
+    telegramNode(
+      'Send Empty Cart View',
+      {
+        chatId: '={{ $json.chatId }}',
+        text: '={{ $json.text }}',
+        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+      },
+      { x: 960, y: 1100 },
+    ),
+  );
+  link('Cart View Empty?', 'Send Empty Cart View', 0);
+
   nodes.push(
     telegramNode(
       'Send Cart',
@@ -2198,10 +2468,10 @@ return [{ json: { chatId: route.chatId, empty: false, text } }];
         },
         additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
       },
-      { x: 740, y: 960 },
+      { x: 960, y: 900 },
     ),
   );
-  link('Read Cart', 'Send Cart', 0);
+  link('Cart View Empty?', 'Send Cart', 1);
 
   nodes.push(
     codeNode(

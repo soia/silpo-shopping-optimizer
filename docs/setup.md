@@ -250,7 +250,9 @@ curl -o /dev/null -w '%{http_code}\n' \
 10. "✅ Застосувати обране (N)" → only the ticked ones are applied
 11. /block <brand>  → that brand is never offered again
 12. /blocked        → the current list, /unblock removes
-10. Verify the total in the Silpo app
+13. /logout         → confirmation button, then "Акаунт від’єднано"
+14. /optimize       → asks to /connect again (a different account can be used)
+15. Verify the total in the Silpo app
 ```
 
 ### Expected result

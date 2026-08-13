@@ -28,7 +28,7 @@
     },
     {
       "parameters": {
-        "jsCode": "\n// Resolves the user's intent. No secrets and no MCP calls happen here.\nconst items = [];\nfor (const item of $input.all()) {\n  const update = item.json;\n  const message = update.message || (update.callback_query && update.callback_query.message);\n  const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);\n  const text = ((update.message && update.message.text) || '').trim();\n  const callbackData = (update.callback_query && update.callback_query.data) || '';\n\n  let action = 'unknown';\n  let planId = null;\n\n  let toggleIndex = null;\n  let brandArg = null;\n\n  if (callbackData) {\n    // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>\n    const parts = callbackData.split(':');\n    action = parts[0] === 't' ? 'toggle' : parts[0];\n    planId = parts[1] || null;\n    if (action === 'toggle') toggleIndex = Number(parts[2]);\n  } else if (text.startsWith('/unblock')) {\n    // Sliced rather than matched: a regex literal here would lose its escapes\n    // passing through the generator's template literal.\n    action = 'unblock';\n    brandArg = text.slice('/unblock'.length).trim();\n  } else if (text.startsWith('/blocked')) {\n    action = 'blocked';\n  } else if (text.startsWith('/block')) {\n    action = 'block';\n    brandArg = text.slice('/block'.length).trim();\n  } else if (text.startsWith('/start')) action = 'start';\n  else if (text.startsWith('/connect')) action = 'connect';\n  else if (text.startsWith('/optimize') || text.includes('Оптимізувати')) action = 'optimize';\n  else if (text.startsWith('/cart')) action = 'cart';\n\n  items.push({ json: {\n    action,\n    planId,\n    toggleIndex,\n    brandArg,\n    chatId: message && message.chat && message.chat.id,\n    telegramUserId: from && from.id,\n    callbackQueryId: (update.callback_query && update.callback_query.id) || null,\n    messageId: (message && message.message_id) || null,\n    firstName: (from && from.first_name) || '',\n  }});\n}\nreturn items;\n",
+        "jsCode": "\n// Resolves the user's intent. No secrets and no MCP calls happen here.\nconst items = [];\nfor (const item of $input.all()) {\n  const update = item.json;\n  const message = update.message || (update.callback_query && update.callback_query.message);\n  const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);\n  const text = ((update.message && update.message.text) || '').trim();\n  const callbackData = (update.callback_query && update.callback_query.data) || '';\n\n  let action = 'unknown';\n  let planId = null;\n\n  let toggleIndex = null;\n  let brandArg = null;\n  // Disconnecting is confirmed by a tap, so the same action arrives twice: once\n  // as the command, once as logout:yes. Only the second one may clear anything.\n  let logoutConfirm = false;\n  let logoutCancel = false;\n\n  if (callbackData) {\n    // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>\n    // | logout:yes\n    const parts = callbackData.split(':');\n    action = parts[0] === 't' ? 'toggle' : parts[0];\n    planId = parts[1] || null;\n    if (action === 'toggle') toggleIndex = Number(parts[2]);\n    if (action === 'logout') {\n      planId = null;\n      logoutConfirm = parts[1] === 'yes';\n      logoutCancel = parts[1] === 'no';\n    }\n  } else if (text.startsWith('/unblock')) {\n    // Sliced rather than matched: a regex literal here would lose its escapes\n    // passing through the generator's template literal.\n    action = 'unblock';\n    brandArg = text.slice('/unblock'.length).trim();\n  } else if (text.startsWith('/blocked')) {\n    action = 'blocked';\n  } else if (text.startsWith('/block')) {\n    action = 'block';\n    brandArg = text.slice('/block'.length).trim();\n  } else if (text.startsWith('/start')) action = 'start';\n  else if (text.startsWith('/connect')) action = 'connect';\n  else if (text.startsWith('/optimize') || text.includes('Оптимізувати')) action = 'optimize';\n  else if (text.startsWith('/cart')) action = 'cart';\n  else if (text.startsWith('/logout') || text.startsWith('/disconnect')) action = 'logout';\n\n  items.push({ json: {\n    action,\n    planId,\n    toggleIndex,\n    brandArg,\n    logoutConfirm,\n    logoutCancel,\n    chatId: message && message.chat && message.chat.id,\n    telegramUserId: from && from.id,\n    callbackQueryId: (update.callback_query && update.callback_query.id) || null,\n    messageId: (message && message.message_id) || null,\n    firstName: (from && from.first_name) || '',\n  }});\n}\nreturn items;\n",
         "mode": "runOnceForAllItems"
       },
       "id": "route-request",
@@ -285,6 +285,26 @@
                 ]
               },
               "outputKey": "blocked"
+            },
+            {
+              "conditions": {
+                "options": {
+                  "caseSensitive": true,
+                  "version": 2
+                },
+                "combinator": "and",
+                "conditions": [
+                  {
+                    "operator": {
+                      "type": "string",
+                      "operation": "equals"
+                    },
+                    "leftValue": "={{ $json.action }}",
+                    "rightValue": "logout"
+                  }
+                ]
+              },
+              "outputKey": "logout"
             }
           ]
         },
@@ -537,6 +557,61 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "empty",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.empty === true }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cart-is-empty-",
+      "name": "Cart Is Empty?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1180,
+        -80
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "🛒 Ваш кошик порожній — оптимізувати нічого.\n\nНаповніть його в застосунку «Сільпо» і надішліть /optimize ще раз.",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-empty-cart",
+      "name": "Send Empty Cart",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1400,
+        60
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
         "jsCode": "\n// The prompt is Ukrainian on purpose: product names and the reasons shown to\n// the customer are Ukrainian, so the model should reason in the same language.\nconst SYSTEM_PROMPT = `Ти — асистент, який перевіряє заміни товарів у кошику супермаркету «Сільпо».\n\nТВОЯ ЄДИНА ЗАДАЧА: вирішити, чи зберігає запропонована заміна СУТЬ покупки.\n\nПРИЙМАЙ, якщо товар виконує ту саму роль:\n- молоко 2.5% -> інше молоко 2.5%\n- макарони -> макарони іншого бренду\n- куряче філе -> куряче філе\n\nВІДХИЛЯЙ, якщо змінюється призначення товару:\n- протеїновий/спортивний -> звичайний солодкий\n- молоко -> рослинний напій (і навпаки)\n- комбуча -> звичайний сік або газованка\n- безлактозний/безглютеновий -> звичайний (дієтичне обмеження)\n- дитяче харчування -> недитяче\n- без цукру -> із цукром\n\nОСОБЛИВА УВАГА: дані «Сільпо» НЕ містять об'єму кандидатів. Якщо ціна падає\nбільш ніж на 50%, це може бути менша упаковка. Тоді confidence не вище 0.6\nі згадай про перевірку об'єму в reason.\n\nВІДПОВІДАЙ ВИКЛЮЧНО JSON, без markdown:\n{\"decisions\":[{\"index\":0,\"accept\":true,\"confidence\":0.85,\"reason\":\"...\"}]}\nreason — українською, до 90 символів.`;\n\nconst plan = $json;\nconst lines = (plan.replacements || []).map((r, i) =>\n  '[' + i + '] було: ' + r.originalName + (r.originalRatio ? ' (' + r.originalRatio + ')' : '')\n  + ' | стане: ' + r.replacementName\n  + ' | падіння ціни: ' + r.savingPct + '%' + (r.verifySize ? ' ПІДОЗРІЛО ВЕЛИКЕ' : '')\n  + (r.onPromotion ? ' | за акцією' : ''));\n\nreturn [{ json: { ...plan,\n  aiSystemPrompt: SYSTEM_PROMPT,\n  aiUserPrompt: 'Перевір ці ' + lines.length + ' замін.\\n\\n' + lines.join('\\n'),\n}}];\n",
         "mode": "runOnceForAllItems"
       },
@@ -660,7 +735,7 @@
     },
     {
       "parameters": {
-        "jsCode": "\n\n// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines\n// $env but throws \"access to env vars denied\" on any property read, so a shared\n// guard would lose the $vars value. Self-hosted Community has no Variables\n// feature (it is licensed) but can set real environment variables, provided\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.\nfunction readVar(name) {\n  try {\n    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;\n    if (v) return v;\n  } catch (e) { /* Variables unavailable - fall through to env */ }\n  try {\n    const v = (typeof $env !== 'undefined' && $env[name]) || null;\n    if (v) return v;\n  } catch (e) { /* env access denied - n8n Cloud */ }\n  return null;\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\nconst plan = $('Apply AI Decisions').first().json;\n// Everything is selected to begin with; the guest unticks what they do not want.\nconst selected = (plan.replacements || []).map((r, i) => i);\nconst card = buildSelectionCard(plan, selected);\n\nconst body = { chat_id: plan.chatId, text: card.text, parse_mode: 'Markdown' };\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: { url: telegramApiUrl('sendMessage'), body } }];\n",
+        "jsCode": "\n\n// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines\n// $env but throws \"access to env vars denied\" on any property read, so a shared\n// guard would lose the $vars value. Self-hosted Community has no Variables\n// feature (it is licensed) but can set real environment variables, provided\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.\nfunction readVar(name) {\n  try {\n    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;\n    if (v) return v;\n  } catch (e) { /* Variables unavailable - fall through to env */ }\n  try {\n    const v = (typeof $env !== 'undefined' && $env[name]) || null;\n    if (v) return v;\n  } catch (e) { /* env access denied - n8n Cloud */ }\n  return null;\n}\n\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nconst plan = $('Apply AI Decisions').first().json;\n// Everything is selected to begin with; the guest unticks what they do not want.\nconst selected = (plan.replacements || []).map((r, i) => i);\nconst card = buildSelectionCard(plan, selected);\n\nconst body = { chat_id: plan.chatId, text: card.text, parse_mode: 'Markdown' };\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: { url: telegramApiUrl('sendMessage'), body } }];\n",
         "mode": "runOnceForAllItems"
       },
       "id": "format-recommendation",
@@ -801,7 +876,8 @@
       "position": [
         740,
         1280
-      ]
+      ],
+      "alwaysOutputData": true
     },
     {
       "parameters": {
@@ -826,6 +902,227 @@
           "name": "Silpo Bot"
         }
       }
+    },
+    {
+      "parameters": {
+        "jsCode": "\n\n// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines\n// $env but throws \"access to env vars denied\" on any property read, so a shared\n// guard would lose the $vars value. Self-hosted Community has no Variables\n// feature (it is licensed) but can set real environment variables, provided\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.\nfunction readVar(name) {\n  try {\n    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;\n    if (v) return v;\n  } catch (e) { /* Variables unavailable - fall through to env */ }\n  try {\n    const v = (typeof $env !== 'undefined' && $env[name]) || null;\n    if (v) return v;\n  } catch (e) { /* env access denied - n8n Cloud */ }\n  return null;\n}\n\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\n// Two steps on purpose: /logout only asks, the button clears. Both replies are\n// built here so the branch needs a single outgoing call before the tables are\n// touched.\n//\n// Confirming edits the prompt instead of sending a new message: that removes the\n// keyboard, so the tap cannot be repeated while the deletion runs.\nconst route = $('Merge Session').first().json;\nconst base = { chatId: route.chatId, telegramUserId: route.telegramUserId };\n\nif (route.logoutCancel) {\n  return [{ json: { ...base, confirmed: false, url: telegramApiUrl('editMessageText'), body: {\n    chat_id: route.chatId,\n    message_id: route.messageId,\n    text: '❌ Скасовано. Акаунт залишився підключеним.',\n  }}}];\n}\n\nif (!route.authorized) {\n  return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {\n    chat_id: route.chatId,\n    text: 'Акаунт «Сільпо» не підключений.\\n\\nЩоб підключити — /connect',\n  }}}];\n}\n\nif (route.logoutConfirm) {\n  return [{ json: { ...base, confirmed: true, url: telegramApiUrl('editMessageText'), body: {\n    chat_id: route.chatId,\n    message_id: route.messageId,\n    text: '🚪 Від’єдную акаунт...',\n  }}}];\n}\n\nreturn [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {\n  chat_id: route.chatId,\n  parse_mode: 'Markdown',\n  text: '🚪 *Від’єднати акаунт «Сільпо»?*\\n\\nЯ видалю збережений доступ і всі підготовлені плани. Ваш кошик і замовлення в «Сільпо» залишаться без змін.\\n\\nПісля цього можна підключити інший акаунт через /connect.\\n\\n_Список заблокованих марок збережеться._',\n  reply_markup: { inline_keyboard: [[\n    { text: '🚪 Так, від’єднати', callback_data: 'logout:yes' },\n    { text: '❌ Ні', callback_data: 'logout:no' },\n  ]] },\n}}}];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "prepare-logout",
+      "name": "Prepare Logout",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.url }}",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.body) }}",
+        "options": {}
+      },
+      "id": "send-logout-reply",
+      "name": "Send Logout Reply",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        740,
+        1440
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "confirmed",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $('Prepare Logout').first().json.confirmed }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "logout-confirmed-",
+      "name": "Logout Confirmed?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        960,
+        1440
+      ]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_SESSIONS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "silpo_sessions"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "telegram_user_id",
+              "keyValue": "={{ $('Prepare Logout').first().json.telegramUserId }}"
+            }
+          ]
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "access_token_enc": "",
+            "refresh_token_enc": "",
+            "client_id": "",
+            "expires_at": ""
+          },
+          "matchingColumns": [],
+          "schema": [
+            {
+              "id": "telegram_user_id",
+              "displayName": "telegram_user_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "number",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "client_id",
+              "displayName": "client_id",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "access_token_enc",
+              "displayName": "access_token_enc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "expires_at",
+              "displayName": "expires_at",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "refresh_token_enc",
+              "displayName": "refresh_token_enc",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            },
+            {
+              "id": "blocked_brands",
+              "displayName": "blocked_brands",
+              "required": false,
+              "defaultMatch": false,
+              "display": true,
+              "type": "string",
+              "readOnly": false,
+              "removed": false
+            }
+          ],
+          "attemptToConvertTypes": false,
+          "convertFieldsToString": false
+        },
+        "options": {}
+      },
+      "id": "clear-session",
+      "name": "Clear Session",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1180,
+        1440
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "operation": "deleteRows",
+        "dataTableId": {
+          "__rl": true,
+          "value": "REPLACE_WITH_PLANS_TABLE_ID",
+          "mode": "list",
+          "cachedResultName": "optimization_plans"
+        },
+        "filters": {
+          "conditions": [
+            {
+              "keyName": "telegram_user_id",
+              "keyValue": "={{ $('Prepare Logout').first().json.telegramUserId }}"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "delete-plans",
+      "name": "Delete Plans",
+      "type": "n8n-nodes-base.dataTable",
+      "typeVersion": 1.1,
+      "position": [
+        1400,
+        1440
+      ],
+      "alwaysOutputData": true
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $('Prepare Logout').first().json.chatId }}",
+        "text": "✅ Акаунт від’єднано.\n\nЗбережений доступ видалено, підготовлені плани стерто. Кошик у «Сільпо» не змінювався.\n\nЩоб підключити інший акаунт — /connect",
+        "additionalFields": {
+          "appendAttribution": false
+        }
+      },
+      "id": "send-logged-out",
+      "name": "Send Logged Out",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        1620,
+        1440
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      },
+      "executeOnce": true
     },
     {
       "parameters": {
@@ -857,7 +1154,7 @@
     },
     {
       "parameters": {
-        "jsCode": "\n\n// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines\n// $env but throws \"access to env vars denied\" on any property read, so a shared\n// guard would lose the $vars value. Self-hosted Community has no Variables\n// feature (it is licensed) but can set real environment variables, provided\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.\nfunction readVar(name) {\n  try {\n    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;\n    if (v) return v;\n  } catch (e) { /* Variables unavailable - fall through to env */ }\n  try {\n    const v = (typeof $env !== 'undefined' && $env[name]) || null;\n    if (v) return v;\n  } catch (e) { /* env access denied - n8n Cloud */ }\n  return null;\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\nconst route = $('Merge Session').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);\nconst row = rows.find(r => String(r.plan_id) === String(route.planId));\n\n// Same ownership boundary as everywhere else a plan is touched.\nif (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {\n  return [{ json: { skip: true, url: telegramApiUrl('answerCallbackQuery'), body: {\n    callback_query_id: route.callbackQueryId,\n    text: 'План застарів — запустіть /optimize ще раз',\n  }}}];\n}\n\nconst plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;\nplan.planId = row.plan_id;\nconst selected = Array.isArray(plan.selected) ? plan.selected.slice() : (plan.replacements || []).map((r, i) => i);\n\nconst index = Number(route.toggleIndex);\nconst at = selected.indexOf(index);\nif (at === -1) selected.push(index); else selected.splice(at, 1);\nselected.sort((a, b) => a - b);\nplan.selected = selected;\n\nconst card = buildSelectionCard(plan, selected);\nconst body = {\n  chat_id: route.chatId,\n  message_id: route.messageId,\n  text: card.text,\n  parse_mode: 'Markdown',\n};\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: {\n  skip: false,\n  planId: row.plan_id,\n  planJson: JSON.stringify(plan),\n  url: telegramApiUrl('editMessageText'),\n  body,\n}}];\n",
+        "jsCode": "\n\n// Two sources, each in its own try/catch. n8n Cloud exposes $vars and defines\n// $env but throws \"access to env vars denied\" on any property read, so a shared\n// guard would lose the $vars value. Self-hosted Community has no Variables\n// feature (it is licensed) but can set real environment variables, provided\n// N8N_BLOCK_ENV_ACCESS_IN_NODE=false.\nfunction readVar(name) {\n  try {\n    const v = (typeof $vars !== 'undefined' && $vars[name]) || null;\n    if (v) return v;\n  } catch (e) { /* Variables unavailable - fall through to env */ }\n  try {\n    const v = (typeof $env !== 'undefined' && $env[name]) || null;\n    if (v) return v;\n  } catch (e) { /* env access denied - n8n Cloud */ }\n  return null;\n}\n\n\nfunction telegramApiUrl(method) {\n  const token = readVar('TELEGRAM_BOT_TOKEN');\n  if (!token) {\n    throw new Error('TELEGRAM_BOT_TOKEN variable is not set (Settings → Variables, scope Global)');\n  }\n  return 'https://api.telegram.org/bot' + token + '/' + method;\n}\n\n\nfunction buildSelectionCard(plan, selected) {\n  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';\n  // Product names go into a Markdown message. An unmatched _ or * makes Telegram\n  // reject the whole send with HTTP 400, so escape them in dynamic text.\n  // Written without regex literals or backslash escapes on purpose: this string\n  // passes through a TypeScript template literal on the way into the node, and\n  // that layer eats them - an earlier build emitted the broken class\n  // a broken character class that silently escaped nothing.\n  const BACKSLASH = String.fromCharCode(92);\n  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);\n  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');\n  const replacements = plan.replacements || [];\n  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);\n  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);\n  const originalTotal = plan.summary.originalTotal;\n\n  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n    + 'Було: *' + money(originalTotal) + '*\\n'\n    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'\n    + '💰 *Економія: ' + money(saving) + '*'\n    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')\n    + '\\n\\n';\n\n  // Nothing to choose from: report what was checked and offer no buttons, since\n  // \"Застосувати\" and \"Деталі\" would both lead nowhere.\n  if (!replacements.length) {\n    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'\n      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'\n      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'\n      + '_Ваш кошик уже оптимальний._';\n    if (plan.slotExpired) {\n      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'\n        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';\n    }\n    if (plan.summary.bonusAvailable > 0) {\n      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';\n    }\n    return { text: empty, keyboard: [] };\n  }\n\n  text += 'Оберіть, що застосувати:\\n\\n';\n  replacements.forEach((r, i) => {\n    const on = selected.indexOf(i) !== -1;\n    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'\n      + '   → ' + md(r.replacementName) + '\\n'\n      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)\n      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')\n      // Shown so the guest can copy it straight into /block.\n      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')\n      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')\n      + '\\n\\n';\n  });\n\n  // Candidate pack size is not in any search response, so it can only be checked\n  // once the item is in the cart. Saying so up front keeps a rollback from\n  // looking like a malfunction.\n  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'\n    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';\n  if (replacements.some(r => r.brand)) {\n    text += '_Не хочете якусь марку? Напишіть_ `/block` _і її назву._\\n\\n';\n  }\n  if (plan.slotExpired) {\n    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';\n  }\n  if (plan.summary.bonusAvailable > 0) {\n    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';\n  }\n\n  // One toggle per replacement, then the action row.\n  const keyboard = replacements.map((r, i) => ([{\n    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),\n    callback_data: 't:' + plan.planId + ':' + i,\n  }]));\n\n  keyboard.push([\n    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },\n    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },\n  ]);\n\n  return { text, keyboard };\n}\n\nconst route = $('Merge Session').first().json;\nconst rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);\nconst row = rows.find(r => String(r.plan_id) === String(route.planId));\n\n// Same ownership boundary as everywhere else a plan is touched.\nif (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {\n  return [{ json: { skip: true, url: telegramApiUrl('answerCallbackQuery'), body: {\n    callback_query_id: route.callbackQueryId,\n    text: 'План застарів — запустіть /optimize ще раз',\n  }}}];\n}\n\nconst plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;\nplan.planId = row.plan_id;\nconst selected = Array.isArray(plan.selected) ? plan.selected.slice() : (plan.replacements || []).map((r, i) => i);\n\nconst index = Number(route.toggleIndex);\nconst at = selected.indexOf(index);\nif (at === -1) selected.push(index); else selected.splice(at, 1);\nselected.sort((a, b) => a - b);\nplan.selected = selected;\n\nconst card = buildSelectionCard(plan, selected);\nconst body = {\n  chat_id: route.chatId,\n  message_id: route.messageId,\n  text: card.text,\n  parse_mode: 'Markdown',\n};\nif (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };\n\nreturn [{ json: {\n  skip: false,\n  planId: row.plan_id,\n  planJson: JSON.stringify(plan),\n  url: telegramApiUrl('editMessageText'),\n  body,\n}}];\n",
         "mode": "runOnceForAllItems"
       },
       "id": "toggle-selection",
@@ -1383,9 +1680,24 @@
     },
     {
       "parameters": {
+        "jsCode": "\n// The command list reflects what the guest can actually do right now: /logout\n// makes no sense before an account is connected, so it only appears afterwards.\nconst route = $('Merge Session').first().json;\n\nlet text = '👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\\n\\n*Основне*\\n';\ntext += route.authorized\n  ? '/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n/logout — від’єднати акаунт (щоб підключити інший)\\n'\n  : '/connect — підключити акаунт Сільпо\\n/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n';\ntext += '\\n*Якщо якусь марку не хочете бачити в замінах*\\n/blocked — ваш список винятків\\n/block + назва марки — не пропонувати її\\n/unblock + назва марки — повернути\\n\\n';\ntext += '_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\\n\\n';\ntext += 'Я шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.';\n\nreturn [{ json: { chatId: route.chatId, text } }];\n",
+        "mode": "runOnceForAllItems"
+      },
+      "id": "build-help",
+      "name": "Build Help",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        660
+      ]
+    },
+    {
+      "parameters": {
         "chatId": "={{ $json.chatId }}",
-        "text": "👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\n\n*Основне*\n/connect — підключити акаунт Сільпо\n/cart — показати кошик\n/optimize — знайти, де можна зекономити\n\n*Якщо якусь марку не хочете бачити в замінах*\n/blocked — ваш список винятків\n/block + назва марки — не пропонувати її\n/unblock + назва марки — повернути\n\n_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\n\nЯ шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.",
+        "text": "={{ $json.text }}",
         "additionalFields": {
+          "parse_mode": "Markdown",
           "appendAttribution": false
         }
       },
@@ -1394,7 +1706,7 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        520,
+        740,
         660
       ],
       "credentials": {
@@ -1512,6 +1824,62 @@
     },
     {
       "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "version": 2
+          },
+          "combinator": "and",
+          "conditions": [
+            {
+              "id": "empty",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              },
+              "leftValue": "={{ $json.empty === true }}",
+              "rightValue": ""
+            }
+          ]
+        },
+        "options": {}
+      },
+      "id": "cart-view-empty-",
+      "name": "Cart View Empty?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        740,
+        960
+      ]
+    },
+    {
+      "parameters": {
+        "chatId": "={{ $json.chatId }}",
+        "text": "={{ $json.text }}",
+        "additionalFields": {
+          "parse_mode": "Markdown",
+          "appendAttribution": false
+        }
+      },
+      "id": "send-empty-cart-view",
+      "name": "Send Empty Cart View",
+      "type": "n8n-nodes-base.telegram",
+      "typeVersion": 1.2,
+      "position": [
+        960,
+        1100
+      ],
+      "credentials": {
+        "telegramApi": {
+          "id": "SILPO_TG",
+          "name": "Silpo Bot"
+        }
+      }
+    },
+    {
+      "parameters": {
         "chatId": "={{ $json.chatId }}",
         "text": "={{ $json.text }}",
         "replyMarkup": "inlineKeyboard",
@@ -1542,8 +1910,8 @@
       "type": "n8n-nodes-base.telegram",
       "typeVersion": 1.2,
       "position": [
-        740,
-        960
+        960,
+        900
       ],
       "credentials": {
         "telegramApi": {
@@ -1809,7 +2177,14 @@
         ],
         [
           {
-            "node": "Send Help",
+            "node": "Prepare Logout",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Help",
             "type": "main",
             "index": 0
           }
@@ -1871,7 +2246,7 @@
       "main": [
         [
           {
-            "node": "Build AI Prompt",
+            "node": "Cart Is Empty?",
             "type": "main",
             "index": 0
           }
@@ -1879,6 +2254,24 @@
         [
           {
             "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cart Is Empty?": {
+      "main": [
+        [
+          {
+            "node": "Send Empty Cart",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build AI Prompt",
             "type": "main",
             "index": 0
           }
@@ -1945,6 +2338,61 @@
         [
           {
             "node": "Send Blocklist",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Logout": {
+      "main": [
+        [
+          {
+            "node": "Send Logout Reply",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Logout Reply": {
+      "main": [
+        [
+          {
+            "node": "Logout Confirmed?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Logout Confirmed?": {
+      "main": [
+        [
+          {
+            "node": "Clear Session",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clear Session": {
+      "main": [
+        [
+          {
+            "node": "Delete Plans",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Delete Plans": {
+      "main": [
+        [
+          {
+            "node": "Send Logged Out",
             "type": "main",
             "index": 0
           }
@@ -2091,6 +2539,17 @@
         ]
       ]
     },
+    "Build Help": {
+      "main": [
+        [
+          {
+            "node": "Send Help",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
     "Load Plan Details": {
       "main": [
         [
@@ -2117,7 +2576,7 @@
       "main": [
         [
           {
-            "node": "Send Cart",
+            "node": "Cart View Empty?",
             "type": "main",
             "index": 0
           }
@@ -2125,6 +2584,24 @@
         [
           {
             "node": "Handle Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Cart View Empty?": {
+      "main": [
+        [
+          {
+            "node": "Send Empty Cart View",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Send Cart",
             "type": "main",
             "index": 0
           }
