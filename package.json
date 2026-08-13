@@ -11,11 +11,13 @@
     "authorize": "node --experimental-strip-types --no-warnings src/cli/authorize.ts",
     "call": "node --experimental-strip-types --no-warnings src/cli/call-tool.ts",
     "optimize": "node --experimental-strip-types --no-warnings --env-file-if-exists=.env src/cli/optimize.ts",
+    "setup:commands": "node --experimental-strip-types --no-warnings src/cli/set-commands.ts",
     "build:workflows": "node --experimental-strip-types --no-warnings src/workflow/build.ts",
     "validate": "node --experimental-strip-types --no-warnings src/workflow/validate.ts",
+    "preview": "node --experimental-strip-types --no-warnings src/workflow/screens.ts",
     "test:node": "node --experimental-strip-types --no-warnings src/workflow/test-node.ts",
     "typecheck": "tsc --noEmit",
-    "check": "npm run typecheck && npm run build:workflows && npm run validate"
+    "check": "npm run typecheck && npm run build:workflows && npm run validate && npm run preview -- --check"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",

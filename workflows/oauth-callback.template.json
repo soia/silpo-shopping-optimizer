@@ -224,8 +224,27 @@
     {
       "parameters": {
         "chatId": "={{ $('Exchange Code').first().json.chat_id }}",
-        "text": "✅ Акаунт «Сільпо» підключено!\n\nТепер натисніть /optimize — і я перевірю ваш кошик.",
+        "text": "✅ <b>Акаунт підключено</b>\n\nТепер я бачу ваш кошик. Перевірити, де можна зекономити?",
+        "replyMarkup": "inlineKeyboard",
+        "inlineKeyboard": {
+          "rows": [
+            {
+              "row": {
+                "buttons": [
+                  {
+                    "text": "✨ Оптимізувати кошик",
+                    "additionalFields": {
+                      "type": "callback_data",
+                      "callback_data": "optimize:"
+                    }
+                  }
+                ]
+              }
+            }
+          ]
+        },
         "additionalFields": {
+          "parse_mode": "HTML",
           "appendAttribution": false
         }
       },
@@ -247,7 +266,7 @@
     {
       "parameters": {
         "respondWith": "text",
-        "responseBody": "<!doctype html><meta charset=\"utf-8\"><body style=\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\"><div style=\"text-align:center\"><div style=\"font-size:56px\">✅</div><h2>Акаунт підключено</h2><p>Поверніться в Telegram.</p></div></body>",
+        "responseBody": "<!doctype html><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><body style=\"font:16px/1.5 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0f1115;color:#e7e9ee\"><div style=\"text-align:center;max-width:22rem;padding:2rem\"><div style=\"width:44px;height:44px;margin:0 auto 1.5rem;border-radius:50%;border:1.5px solid #3ecf8e;display:grid;place-items:center;color:#3ecf8e;font-size:20px\">✓</div><h1 style=\"font-size:1.25rem;font-weight:600;margin:0 0 .5rem\">Акаунт підключено</h1><p style=\"margin:0;opacity:.6\">Поверніться в Telegram — усе готово.</p></div></body>",
         "options": {
           "responseCode": 200,
           "responseHeaders": {
@@ -272,7 +291,7 @@
     {
       "parameters": {
         "respondWith": "text",
-        "responseBody": "={{ \"<!doctype html><meta charset=\\\"utf-8\\\"><body style=\\\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\\\"><div style=\\\"text-align:center\\\"><div style=\\\"font-size:56px\\\">⚠️</div><h2>Не вдалося підключити</h2><p>\" + $json.message + \"</p></div></body>\" }}",
+        "responseBody": "={{ \"<!doctype html><meta charset=\\\"utf-8\\\"><meta name=\\\"viewport\\\" content=\\\"width=device-width,initial-scale=1\\\"><body style=\\\"font:16px/1.5 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0f1115;color:#e7e9ee\\\"><div style=\\\"text-align:center;max-width:22rem;padding:2rem\\\"><div style=\\\"width:44px;height:44px;margin:0 auto 1.5rem;border-radius:50%;border:1.5px solid #d0763a\\\"></div><h1 style=\\\"font-size:1.25rem;font-weight:600;margin:0 0 .5rem\\\">Не вдалося підключити</h1><p style=\\\"margin:0;opacity:.6\\\">\" + $json.message + \"</p></div></body>\" }}",
         "options": {
           "responseCode": 400,
           "responseHeaders": {

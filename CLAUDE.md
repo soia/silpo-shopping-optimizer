@@ -63,15 +63,26 @@ this, all silent or misleading:
 `npm run typecheck` catches the first two. The third only shows up in output, so
 test the emitted code, not the source.
 
-## 5. One source of truth for the engine
+## 5. One source of truth for the engine — and for the copy
 
-`src/lib/optimizer.ts` is transpiled and inlined into the n8n Code nodes by
+`src/lib/optimizer.ts` (engine) and `src/lib/ui.ts` (every guest-facing string
+and keyboard) are transpiled and inlined into the n8n Code nodes by
 `src/workflow/build.ts`.
 
 - **Never hand-edit `workflows/*.json`.** It is generated output.
 - Change logic in `src/lib/`, then `npm run build:workflows`.
-- Finish with `npm run check` (typecheck → build → validate) before calling
-  anything done.
+- Finish with `npm run check` (typecheck → build → validate → screens) before
+  calling anything done.
+
+`npm run preview` renders every screen out of the generated JSON the way Telegram
+paints it — bold, italic, struck-through, buttons. **Look at it after any change
+to the copy.** Three of the defects in this file's history were invisible in the
+source and obvious in that output: raw `<b>` tags, four cart lines clipped to the
+same text, and a message that read as a formula.
+
+`npm run preview -- --check` runs the assertions alone and is part of
+`npm run check`, so a screen that breaks a rule fails the build rather than
+reaching a guest.
 
 ## 6. Writes require explicit human confirmation
 
@@ -140,6 +151,43 @@ proposing it first.
 
 ## 11. Telegram
 
+- **Buttons are the interface; commands are the fallback.** No screen prints a
+  command — they are registered with `npm run setup:commands` and live under
+  Telegram's «/» menu. A new capability gets a button on the screen it belongs
+  to, not a line of text on the home screen.
+- **A message carries one `reply_markup`.** The persistent keyboard therefore
+  cannot share a message with inline buttons; it rides on the progress line,
+  which needs none. Moving it means finding another button-free message.
+- **Answer every callback.** An unanswered tap spins for ~30 s, reads as a hang
+  and invites the second press that once caused a double apply. `Build Ack`
+  covers every branch; only screens that show a toast answer their own, because
+  Telegram accepts one answer per query.
+- Navigation edits the tapped message (`screenRequests`); results and errors
+  send. A screen that appends instead of editing leaves dead menus behind.
+- **Messages are `parse_mode: 'HTML'`, not Markdown.** The reason is `<s>`: a
+  struck-out old price says "discount" with no word to decode, and legacy
+  Markdown has no strikethrough. Escape dynamic text with `esc()` — `&`, `<`,
+  `>` — and use the `b()` / `i()` / `s()` helpers rather than writing tags by
+  hand. Never mix in `*bold*`; it will render literally.
+- **Build every message body with `message()`.** It is the only thing that sets
+  `parse_mode`, and a body assembled by hand renders `<b>Аналізую кошик…</b>`
+  with the tags showing. That shipped once, from `Build Progress`, and nothing
+  in the type system or the validator noticed — the helper exists so the mistake
+  is no longer possible to make.
+- **Emoji mark, they do not decorate.** One per screen title or section, one per
+  line as a status marker (🎁 акція, 💰 економія, 💳 балабонуси, ⏰ слот, 📦
+  об'єм). Two on one line is the point where a product starts looking like a
+  toy — and where a fifteen-item cart stops being scannable.
+- **A number needs a label or a partner.** «🎁 −100,00 ₴» was minus what, off
+  what? Either put a word beside it («економія 14,00 ₴») or pair it with the
+  number that explains it (new price beside the struck-out old one). A bare
+  signed number in a row of prices reads as a third price.
+- **Lists keep a fixed rhythm** — every item the same number of lines, names
+  clipped at a word by `clipAll()`. That helper decides the clip **from the whole
+  list**: Silpo writes a product family as one long shared prefix plus one
+  distinguishing word past any sensible cut, so four «Напій сокoвмісний
+  Моршинська …» clip to four identical rows. Colliding clips are thrown away and
+  those items keep their full name. Never clip a name in isolation.
 - The n8n Telegram node renders a keyboard declared in its parameters, so it
   cannot produce one button per replacement. The selection card and its updates
   go through the Bot API via HTTP Request, with `reply_markup` built in code.
@@ -154,8 +202,12 @@ proposing it first.
 
 - Code, comments, identifiers, docs, log output: **English**.
 - Strings the customer reads in Telegram, and the model prompt that generates
-  them: **Ukrainian** — the bot serves Silpo guests. They are centralized in
-  `src/workflow/build.ts`.
+  them: **Ukrainian** — the bot serves Silpo guests. They all live in
+  `src/lib/ui.ts`, which is inlined into the Code nodes the same way the engine
+  is. Do not write guest-facing text anywhere else, and do not reintroduce it
+  into the template literals in `src/workflow/build.ts` — that file interpolates
+  the module, so copy written there loses the escaping-free property that makes
+  the module safe.
 - Cyrillic in code is acceptable only as data examples (`"112,5г"`, `«Напій»`)
   or matching patterns.
 - `docs/brief.md` is the original brief and stays verbatim in Ukrainian.

@@ -139,9 +139,23 @@ model recognises cases the keyword rules reject too bluntly.
 | `N8N_BASE_URL` | Global | no | Overrides the URL compiled into the workflows |
 
 `TELEGRAM_BOT_TOKEN` duplicates what the Telegram credential already holds. It is
-needed because the selection card has one button per replacement, and the n8n
-Telegram node only renders a keyboard fixed at design time — those two messages
-go through the Bot API directly, and a Code node cannot read a credential.
+needed because most screens build their keyboard in code — the selection card has
+one button per replacement, the brands list one per brand, and navigation edits
+the message that was tapped — while the n8n Telegram node only renders a keyboard
+fixed at design time. Those messages go through the Bot API directly, and a Code
+node cannot read a credential.
+
+### Register the command menu
+
+Run once per bot, from the repository:
+
+```bash
+TELEGRAM_BOT_TOKEN=… npm run setup:commands
+```
+
+This is what keeps commands out of the messages: they appear under Telegram's
+«/» menu instead, as the fallback they are. Skipping it does not break anything —
+the commands still work — but nothing on screen will mention them.
 
 Pick **Global**, not Personal: the workflow reads the value on every execution,
 whoever triggered it.
@@ -238,21 +252,26 @@ curl -o /dev/null -w '%{http_code}\n' \
 
 ```
 1.  Open @SilpoBasketAIBot in Telegram
-2.  /start          → welcome message with the command list
-2a. /cart           → current cart contents + "Оптимізувати" button
-3.  /connect        → "🔗 Увійти в Сільпо" button
-4.  Tap it          → auth.silpo.ua → phone + OTP
-5.  Browser         → "Акаунт підключено"
-6.  Telegram        → "✅ Акаунт «Сільпо» підключено!"
-7.  /optimize       → progress message
-8.  after ~5–10 s   → savings card, one checkbox per replacement
-9.  tap a checkbox  → it unticks in place, totals recalculate
-10. "✅ Застосувати обране (N)" → only the ticked ones are applied
-11. /block <brand>  → that brand is never offered again
-12. /blocked        → the current list, /unblock removes
-13. /logout         → confirmation button, then "Акаунт від’єднано"
-14. /optimize       → asks to /connect again (a different account can be used)
-15. Verify the total in the Silpo app
+2.  /start           → home, one button: "Підключити «Сільпо»"
+3.  tap it           → "Увійти в «Сільпо»" link button
+4.  tap that         → auth.silpo.ua → phone + OTP
+5.  Browser          → "Акаунт підключено"
+6.  Telegram         → "Акаунт підключено" + "Оптимізувати кошик"
+7.  tap Оптимізувати → "Аналізую кошик…", and the persistent keyboard appears
+                       under the input field: Оптимізувати / Мій кошик / Налаштування
+8.  after ~5–10 s    → savings card, one checkbox per replacement
+9.  tap a checkbox   → it unticks in place, totals recalculate, no new message
+10. "Деталі"         → full breakdown with reasons, prices, brands
+11. "Застосувати · N"→ only the ticked ones are applied, then "Мій кошик"
+12. keyboard: Налаштування → account state, brand count, "Як це працює"
+13. "Марки"          → list with a ✕ on each row
+14. "+ Додати марку" → prompt; reply with just the name, no command
+15. tap a ✕          → row disappears, toast confirms, message edits in place
+16. "‹ Назад" twice  → Settings, then home — still one message, not four
+17. "/" menu         → every command listed by Telegram itself
+18. /logout          → confirmation button, then "Акаунт від’єднано"
+19. /optimize        → asks to connect again (a different account can be used)
+20. Verify the total in the Silpo app
 ```
 
 ### Expected result
@@ -391,9 +410,15 @@ npm install
 npm run authorize     # OAuth 2.1 + PKCE, dumps all 39 tool schemas
 npm run call -- silpo_get_my_shopping_cart
 npm run optimize      # full analysis of the real cart, read-only
-npm run check         # typecheck + regenerate + validate workflows
+npm run check         # typecheck + regenerate + validate + check every screen
+npm run preview       # render every screen as Telegram paints it
 npm run test:node     # run a generated Code node against live MCP
 ```
+
+`npm run preview` reads the generated workflow, pulls the UI module out of it and
+renders all 27 screens in the terminal with bold, italic and struck-through text
+and their buttons — the fastest way to judge a copy change without a phone. Add
+`-- --check` for the assertions alone; `npm run check` already includes them.
 
 `npm run optimize` picks up `ANTHROPIC_API_KEY` from a local `.env` (see
 `.env.example`) to enable the semantic layer. Everything the deployed bot needs

@@ -17,6 +17,7 @@ import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import ts from 'typescript';
 import { PLACEHOLDERS, deployment, hasDeployment, personalise } from './config.ts';
+import { UI, BUTTON } from '../lib/ui.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const outFile = (name: string) => resolve(ROOT, 'workflows', name);
@@ -55,6 +56,17 @@ function inlineModule(relativePath: string): string {
 }
 
 const OPTIMIZER = inlineModule('src/lib/optimizer.ts');
+
+/**
+ * The presentation layer, inlined the same way the engine is.
+ *
+ * Everything the guest reads lives in `src/lib/ui.ts`. Because that file is read
+ * from disk and interpolated rather than written inside a template literal, its
+ * strings are ordinary source — a newline is `\n`, an apostrophe needs no
+ * escape, and the double-escaping trap that bit this generator three times does
+ * not apply to copy any more.
+ */
+const UI_MODULE = inlineModule('src/lib/ui.ts');
 
 /* ------------------------------------------------------------------ helpers */
 
@@ -296,98 +308,6 @@ function brandMatches(a, b) {
   const shorter = left.length <= right.length ? left : right;
   const longer = left.length <= right.length ? right : left;
   return shorter.length >= 4 && longer.indexOf(shorter) !== -1;
-}
-`;
-
-/**
- * Builds the selection card — text plus a checkbox keyboard.
- *
- * The n8n Telegram node takes a keyboard declared in its parameters, so it
- * cannot render one button per replacement when the count varies. These two
- * messages therefore go through the Telegram Bot API directly, where
- * `reply_markup` is just JSON we assemble here.
- */
-const SELECTION_CARD = `
-function buildSelectionCard(plan, selected) {
-  const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';
-  // Product names go into a Markdown message. An unmatched _ or * makes Telegram
-  // reject the whole send with HTTP 400, so escape them in dynamic text.
-  // Written without regex literals or backslash escapes on purpose: this string
-  // passes through a TypeScript template literal on the way into the node, and
-  // that layer eats them - an earlier build emitted the broken class
-  // a broken character class that silently escaped nothing.
-  const BACKSLASH = String.fromCharCode(92);
-  const MD_SPECIAL = '_*[]' + String.fromCharCode(96);
-  const md = t => String(t).split('').map(ch => (MD_SPECIAL.indexOf(ch) === -1 ? ch : BACKSLASH + ch)).join('');
-  const replacements = plan.replacements || [];
-  const chosen = replacements.filter((r, i) => selected.indexOf(i) !== -1);
-  const saving = chosen.reduce((sum, r) => sum + r.saving, 0);
-  const originalTotal = plan.summary.originalTotal;
-
-  let text = '🛒 *Я проаналізував ваш кошик*\\n\\n'
-    + 'Було: *' + money(originalTotal) + '*\\n'
-    + 'Може стати: *' + money(originalTotal - saving) + '*\\n\\n'
-    + '💰 *Економія: ' + money(saving) + '*'
-    + (originalTotal > 0 ? ' (' + (Math.round(saving / originalTotal * 1000) / 10) + '%)' : '')
-    + '\\n\\n';
-
-  // Nothing to choose from: report what was checked and offer no buttons, since
-  // "Застосувати" and "Деталі" would both lead nowhere.
-  if (!replacements.length) {
-    let empty = '🛒 *Я проаналізував ваш кошик*\\n\\n'
-      + plan.summary.itemsAnalyzed + ' товарів на *' + money(originalTotal) + '*\\n\\n'
-      + '✅ Дешевших аналогів, які зберігають суть покупки, не знайшов.\\n'
-      + '_Ваш кошик уже оптимальний._';
-    if (plan.slotExpired) {
-      empty += '\\n\\n⏰ _Слот доставки протух — наявність могла зчитатися неточно.'
-        + ' Оберіть новий слот у застосунку і спробуйте ще раз._';
-    }
-    if (plan.summary.bonusAvailable > 0) {
-      empty += '\\n\\n💳 Балабонуси: ' + plan.summary.bonusAvailable + ' грн — застосуйте при оформленні.';
-    }
-    return { text: empty, keyboard: [] };
-  }
-
-  text += 'Оберіть, що застосувати:\\n\\n';
-  replacements.forEach((r, i) => {
-    const on = selected.indexOf(i) !== -1;
-    text += (on ? '✅ ' : '☐ ') + (i + 1) + '. ' + md(r.originalName) + '\\n'
-      + '   → ' + md(r.replacementName) + '\\n'
-      + '   ' + money(r.originalPrice) + ' → ' + money(r.replacementPrice)
-      + '  💰 −' + money(r.saving) + (r.onPromotion ? ' 🎁' : '')
-      // Shown so the guest can copy it straight into /block.
-      + (r.brand ? '\\n   марка: ' + md(r.brand) : '')
-      + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм' : '')
-      + '\\n\\n';
-  });
-
-  // Candidate pack size is not in any search response, so it can only be checked
-  // once the item is in the cart. Saying so up front keeps a rollback from
-  // looking like a malfunction.
-  text += '_Об\\'єм упаковки «Сільпо» у пошуку не показує. Перевірю його при застосуванні'
-    + ' і скасую заміну, якщо він суттєво відрізняється._\\n\\n';
-  if (replacements.some(r => r.brand)) {
-    text += '_Не хочете якусь марку? Напишіть_ \`/block\` _і її назву._\\n\\n';
-  }
-  if (plan.slotExpired) {
-    text += '⏰ _Слот доставки протух — наявність може відрізнятися._\\n\\n';
-  }
-  if (plan.summary.bonusAvailable > 0) {
-    text += '💳 _Балабонуси: ' + plan.summary.bonusAvailable + ' грн, застосуйте при оформленні._';
-  }
-
-  // One toggle per replacement, then the action row.
-  const keyboard = replacements.map((r, i) => ([{
-    text: (selected.indexOf(i) !== -1 ? '✅ ' : '☐ ') + (i + 1) + '. ' + r.originalName.slice(0, 28),
-    callback_data: 't:' + plan.planId + ':' + i,
-  }]));
-
-  keyboard.push([
-    { text: '✅ Застосувати обране (' + chosen.length + ')', callback_data: 'apply:' + plan.planId },
-    { text: '❌ Скасувати', callback_data: 'cancel:' + plan.planId },
-  ]);
-
-  return { text, keyboard };
 }
 `;
 
@@ -719,6 +639,7 @@ function buildBotWorkflow() {
     codeNode(
       'Route Request',
       `
+${UI_MODULE}
 // Resolves the user's intent. No secrets and no MCP calls happen here.
 const items = [];
 for (const item of $input.all()) {
@@ -727,12 +648,17 @@ for (const item of $input.all()) {
   const from = (update.message && update.message.from) || (update.callback_query && update.callback_query.from);
   const text = ((update.message && update.message.text) || '').trim();
   const callbackData = (update.callback_query && update.callback_query.data) || '';
+  // A reply to the «+ Додати марку» prompt carries a brand name and nothing
+  // else — no command, no syntax for the guest to get right.
+  const replyTo = (update.message && update.message.reply_to_message && update.message.reply_to_message.text) || '';
+  const isBrandReply = replyTo.indexOf(BRAND_PROMPT_MARKER) === 0;
 
   let action = 'unknown';
   let planId = null;
 
   let toggleIndex = null;
   let brandArg = null;
+  let brandIndex = null;
   // Disconnecting is confirmed by a tap, so the same action arrives twice: once
   // as the command, once as logout:yes. Only the second one may clear anything.
   let logoutConfirm = false;
@@ -740,16 +666,26 @@ for (const item of $input.all()) {
 
   if (callbackData) {
     // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>
-    // | logout:yes
+    // | logout:yes | brx:<index> | home: | settings: | brands: | bradd: | about:
     const parts = callbackData.split(':');
     action = parts[0] === 't' ? 'toggle' : parts[0];
     planId = parts[1] || null;
     if (action === 'toggle') toggleIndex = Number(parts[2]);
+    if (action === 'brx') {
+      action = 'brandRemove';
+      planId = null;
+      brandIndex = Number(parts[1]);
+    }
+    if (action === 'bradd') action = 'brandAdd';
+    if (action === 'brands') action = 'blocked';
     if (action === 'logout') {
       planId = null;
       logoutConfirm = parts[1] === 'yes';
       logoutCancel = parts[1] === 'no';
     }
+  } else if (isBrandReply) {
+    action = 'block';
+    brandArg = text;
   } else if (text.startsWith('/unblock')) {
     // Sliced rather than matched: a regex literal here would lose its escapes
     // passing through the generator's template literal.
@@ -762,8 +698,11 @@ for (const item of $input.all()) {
     brandArg = text.slice('/block'.length).trim();
   } else if (text.startsWith('/start')) action = 'start';
   else if (text.startsWith('/connect')) action = 'connect';
-  else if (text.startsWith('/optimize') || text.includes('Оптимізувати')) action = 'optimize';
-  else if (text.startsWith('/cart')) action = 'cart';
+  // The persistent keyboard sends its label as an ordinary message, so each of
+  // the three chrome buttons is matched here as well as its command.
+  else if (text.startsWith('/optimize') || text.indexOf('Оптимізувати') !== -1) action = 'optimize';
+  else if (text.startsWith('/cart') || text.indexOf('Мій кошик') !== -1) action = 'cart';
+  else if (text.startsWith('/settings') || text.indexOf('Налаштування') !== -1) action = 'settings';
   else if (text.startsWith('/logout') || text.startsWith('/disconnect')) action = 'logout';
 
   items.push({ json: {
@@ -771,6 +710,7 @@ for (const item of $input.all()) {
     planId,
     toggleIndex,
     brandArg,
+    brandIndex,
     logoutConfirm,
     logoutCancel,
     chatId: message && message.chat && message.chat.id,
@@ -786,6 +726,54 @@ return items;
     ),
   );
   link('Telegram Trigger', 'Route Request');
+
+  /* --- callback acknowledgement --------------------------------------- */
+  //
+  // A tap that is never acknowledged leaves the button spinning for half a
+  // minute, which reads as a hang and invites a second press — the same reflex
+  // that once caused a double apply. This branch answers every callback the
+  // moment it arrives, in parallel with the work it triggered.
+  //
+  // The screens excluded here answer their own callback because they carry a
+  // toast («Ascania повернуто в пошук»), and Telegram accepts one answer per
+  // query.
+  nodes.push(
+    codeNode(
+      'Build Ack',
+      `
+${READ_VAR}
+${TELEGRAM_API}
+const SELF_ACKING = ['home', 'settings', 'about', 'blocked', 'block', 'unblock', 'brandAdd', 'brandRemove'];
+
+return $input.all()
+  .filter(i => i.json.callbackQueryId && SELF_ACKING.indexOf(i.json.action) === -1)
+  .map(i => ({ json: {
+    url: telegramApiUrl('answerCallbackQuery'),
+    body: { callback_query_id: i.json.callbackQueryId },
+  }}));
+`,
+      { x: -380, y: 200 },
+    ),
+  );
+  link('Route Request', 'Build Ack');
+
+  nodes.push(
+    makeNode(
+      'Send Ack',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
+      },
+      // A failed acknowledgement must never take down the run it belongs to.
+      { typeVersion: 4.2, x: -160, y: 200, onError: 'continueRegularOutput' },
+    ),
+  );
+  link('Build Ack', 'Send Ack');
 
   nodes.push(
     dataTableNode(
@@ -845,6 +833,11 @@ return routed.map(r => {
             { conditions: stringCondition('unblock'), outputKey: 'unblock' },
             { conditions: stringCondition('blocked'), outputKey: 'blocked' },
             { conditions: stringCondition('logout'), outputKey: 'logout' },
+            { conditions: stringCondition('settings'), outputKey: 'settings' },
+            { conditions: stringCondition('about'), outputKey: 'about' },
+            { conditions: stringCondition('brandRemove'), outputKey: 'brandRemove' },
+            { conditions: stringCondition('brandAdd'), outputKey: 'brandAdd' },
+            { conditions: stringCondition('home'), outputKey: 'home' },
           ],
         },
         options: { fallbackOutput: 'extra', renameFallbackOutput: 'other' },
@@ -935,7 +928,7 @@ return out;
       'Send Login Link',
       {
         chatId: "={{ $('Build Auth URL').item.json.chatId }}",
-        text: '🔐 *Підключення акаунта «Сільпо»*\n\nНатисніть кнопку нижче та увійдіть за номером телефону.\nПісля входу поверніться сюди — я повідомлю про готовність.\n\n_Ваш токен зберігається зашифровано на сервері й ніколи не передається в Telegram._',
+        text: UI.connectPrompt,
         // replyMarkup and inlineKeyboard are top-level parameters of the node,
         // not members of additionalFields — putting them there silently drops
         // the keyboard and sends a plain message.
@@ -945,13 +938,13 @@ return out;
             {
               row: {
                 buttons: [
-                  { text: '🔗 Увійти в Сільпо', additionalFields: { type: 'url', url: "={{ $('Build Auth URL').item.json.authUrl }}" } },
+                  { text: BUTTON.login, additionalFields: { type: 'url', url: "={{ $('Build Auth URL').item.json.authUrl }}" } },
                 ],
               },
             },
           ],
         },
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       { x: 960, y: -320 },
     ),
@@ -979,24 +972,62 @@ return out;
   nodes.push(
     telegramNode(
       'Ask To Connect',
-      { chatId: '={{ $json.chatId }}', text: '👋 Спершу підключіть акаунт «Сільпо» — інакше я не побачу ваш кошик.\n\nНатисніть /connect', additionalFields: { appendAttribution: false } },
+      {
+        chatId: '={{ $json.chatId }}',
+        text: UI.connectFirst,
+        // A dead end with instructions is a dead end. The one thing to do next
+        // is a button.
+        replyMarkup: 'inlineKeyboard',
+        inlineKeyboard: {
+          rows: [{ row: { buttons: [{ text: BUTTON.connect, additionalFields: { type: 'callback_data', callback_data: 'connect:' } }] } }],
+        },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+      },
       { x: 740, y: 160 },
     ),
   );
   link('Is Authorized?', 'Ask To Connect', 1);
 
+  // The progress line carries the persistent keyboard.
+  //
+  // Telegram allows one reply_markup per message, so the always-visible chrome
+  // cannot ride on a screen that already has inline buttons. This message needs
+  // no buttons of its own and every guest passes through it on their first
+  // /optimize, which makes it the natural place to install the keyboard. Sent
+  // through the Bot API rather than the Telegram node so the markup is literal
+  // JSON — a mistyped node parameter would drop the keyboard silently.
   nodes.push(
-    telegramNode(
-      'Send Progress',
-      {
-        chatId: '={{ $json.chatId }}',
-        text: '🛒 Оптимізуємо ваш кошик...\n\n🔎 Перевіряю альтернативи\n🎁 Перевіряю акції\n🎟 Перевіряю купони\n💳 Перевіряю балабонуси',
-        additionalFields: { appendAttribution: false },
-      },
+    codeNode(
+      'Build Progress',
+      `
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
+const route = $('Merge Session').first().json;
+return [{ json: { url: telegramApiUrl('sendMessage'),
+  body: message(route.chatId, UI.analysing, { reply_markup: homeKeyboard() }) }}];
+`,
       { x: 740, y: -80 },
     ),
   );
-  link('Is Authorized?', 'Send Progress', 0);
+  link('Is Authorized?', 'Build Progress', 0);
+
+  nodes.push(
+    makeNode(
+      'Send Progress',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
+      },
+      { typeVersion: 4.2, x: 960, y: -80 },
+    ),
+  );
+  link('Build Progress', 'Send Progress');
 
   nodes.push(
     codeNode(
@@ -1201,8 +1232,8 @@ return [{ json: {
       'Send Empty Cart',
       {
         chatId: '={{ $json.chatId }}',
-        text: '🛒 Ваш кошик порожній — оптимізувати нічого.\n\nНаповніть його в застосунку «Сільпо» і надішліть /optimize ще раз.',
-        additionalFields: { appendAttribution: false },
+        text: UI.cartEmptyForOptimize,
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       { x: 1400, y: 60 },
     ),
@@ -1383,7 +1414,9 @@ const stored = {
     verifySize: r.verifySize,
     aiReason: r.aiReason,
   })),
-  summary: { originalTotal, saving },
+  // bonusAvailable is stored because the card is re-rendered on every tick, and
+  // without it the bonus note vanished after the guest's first tap.
+  summary: { originalTotal, saving, itemsAnalyzed: plan.summary.itemsAnalyzed, bonusAvailable: plan.summary.bonusAvailable },
 };
 
 // Telegram caps callback_data at 64 bytes, and a toggle carries plan id plus an
@@ -1431,13 +1464,13 @@ return [{ json: { ...plan,
       `
 ${READ_VAR}
 ${TELEGRAM_API}
-${SELECTION_CARD}
+${UI_MODULE}
 const plan = $('Apply AI Decisions').first().json;
 // Everything is selected to begin with; the guest unticks what they do not want.
 const selected = (plan.replacements || []).map((r, i) => i);
 const card = buildSelectionCard(plan, selected);
 
-const body = { chat_id: plan.chatId, text: card.text, parse_mode: 'Markdown' };
+const body = message(plan.chatId, card.text);
 if (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };
 
 return [{ json: { url: telegramApiUrl('sendMessage'), body } }];
@@ -1466,61 +1499,79 @@ return [{ json: { url: telegramApiUrl('sendMessage'), body } }];
   );
   link('Format Recommendation', 'Send Recommendation');
 
-  /* --- brand blocklist: /block, /unblock, /blocked --------------------- */
+  /* --- brand preferences: the Brands screen and its mutations ---------- */
+  //
+  // One screen, four ways in: the ✕ on a row, the «+ Додати марку» prompt, and
+  // the /block and /unblock commands kept as fallbacks. Every one of them ends
+  // on the same rendered list, so there is no separate "confirmation message"
+  // state to design or to dismiss.
   nodes.push(
     codeNode(
       'Update Blocklist',
       `
 ${BRAND_HELPERS}
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
 // Brands the guest never wants offered. Stored pipe-separated on their session
 // row, matched case-insensitively against both the product name and the
 // "Торгова марка" attribute that get_product_details returns.
 const route = $('Merge Session').first().json;
 const current = route.blockedBrands || [];
 const brand = (route.brandArg || '').trim();
-const lower = brand.toLowerCase();
+const ctx = { chatId: route.chatId, messageId: route.messageId, callbackQueryId: route.callbackQueryId };
 
 let next = current.slice();
-let text;
+let toast = null;
+let notice = null;
+let requests;
 
-if (route.action === 'block') {
-  if (!brand) {
-    text = '🚫 *Не пропонувати марку*\\n\\nНапишіть команду разом із назвою марки — вона вказана під кожною заміною в картці оптимізації.\\n\\nНаприклад: \`/block\` і далі назва.';
-  } else if (current.some(b => brandMatches(b, brand))) {
-    text = '🚫 «' + brand + '» вже у чорному списку.';
-  } else {
-    next = current.concat([brand]);
-    text = '🚫 «' + brand + '» додано.\\n\\n_Більше не пропонуватиму цю марку як заміну._';
-  }
-} else if (route.action === 'unblock') {
-  if (!brand) {
-    text = 'Напишіть \`/unblock\` і назву марки, яку хочете повернути.\\n\\nПоточний список — /blocked';
-  } else {
-    next = current.filter(b => !brandMatches(b, brand));
-    text = next.length === current.length
-      ? '«' + brand + '» не було у списку.'
-      : '✅ «' + brand + '» прибрано з чорного списку.';
-  }
+if (route.action === 'brandAdd' || (route.action === 'block' && !brand) || (route.action === 'unblock' && !brand)) {
+  // Nothing to save — ask for the name and let the reply come back as a block.
+  requests = brandPromptRequest(ctx);
 } else {
-  text = current.length
-    ? '🚫 *Ці марки я не пропоную*\\n\\n' + current.map(b => '• ' + b).join('\\n')
-      + '\\n\\n_Повернути:_ \`/unblock\` і назва марки'
-    : '🚫 *Список винятків порожній*\\n\\nЯ пропоную заміни будь-яких марок.\\n\\nЩоб виключити якусь, напишіть \`/block\` і назву марки — вона вказана під кожною заміною в картці оптимізації.';
+  if (route.action === 'block') {
+    if (current.some(b => brandMatches(b, brand))) {
+      toast = brandToast('duplicate', brand);
+    } else {
+      next = current.concat([brand]);
+      toast = brandToast('added', brand);
+    }
+  } else if (route.action === 'unblock') {
+    next = current.filter(b => !brandMatches(b, brand));
+    if (next.length !== current.length) toast = brandToast('removed', brand);
+  } else if (route.action === 'brandRemove') {
+    // The ✕ carries the row index rather than the name: a brand can be longer
+    // than the 64 bytes callback_data allows.
+    const removed = current[Number(route.brandIndex)];
+    if (removed) {
+      next = current.filter((b, i) => i !== Number(route.brandIndex));
+      toast = brandToast('removed', removed);
+    }
+  }
+  // A command has no callback to toast into, so the same words go on the screen.
+  if (toast && !route.callbackQueryId) notice = toast;
+  requests = screenRequests(buildBrandsCard(next, notice), ctx, toast);
 }
 
-return [{ json: {
+return requests.map(r => ({ json: {
   chatId: route.chatId,
   telegramUserId: route.telegramUserId,
   blockedValue: next.join('|'),
-  text,
-}}];
+  url: telegramApiUrl(r.method),
+  body: r.body,
+}}));
 `,
       { x: 520, y: 1280 },
     ),
   );
+  // block, unblock, brandRemove, brandAdd. Reading the list is not a mutation
+  // and goes to Show Brands instead — routing 'blocked' here as well would draw
+  // the screen twice.
   link('Switch Action', 'Update Blocklist', 7);
   link('Switch Action', 'Update Blocklist', 8);
-  link('Switch Action', 'Update Blocklist', 9);
+  link('Switch Action', 'Update Blocklist', 13);
+  link('Switch Action', 'Update Blocklist', 14);
 
   nodes.push(
     dataTableNode(
@@ -1528,28 +1579,48 @@ return [{ json: {
       {
         operation: 'update',
         table: TABLES.sessions,
-        filters: [{ keyName: 'telegram_user_id', keyValue: '={{ $json.telegramUserId }}' }],
-        columns: { blocked_brands: '={{ $json.blockedValue }}' },
+        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Update Blocklist').first().json.telegramUserId }}" }],
+        columns: { blocked_brands: "={{ $('Update Blocklist').first().json.blockedValue }}" },
       },
       // Same trap as the logout branch: a guest who never connected has no
       // session row, so the update touches nothing and the reply would be lost.
-      { x: 740, y: 1280, alwaysOutputData: true },
+      // executeOnce because the screen is two API calls (ack, then draw) and the
+      // list must be written once, not once per call.
+      { x: 740, y: 1280, alwaysOutputData: true, executeOnce: true },
     ),
   );
   link('Update Blocklist', 'Save Blocklist');
 
+  // Save Blocklist runs once and emits one item; the screen is two API calls.
+  // This restores them after the write, so the list is persisted before it is
+  // drawn and the guest can never see a state that was not saved.
   nodes.push(
-    telegramNode(
-      'Send Blocklist',
-      {
-        chatId: "={{ $('Update Blocklist').first().json.chatId }}",
-        text: "={{ $('Update Blocklist').first().json.text }}",
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
-      },
+    codeNode(
+      'Brand Screen Requests',
+      `
+return $('Update Blocklist').all().map(i => ({ json: { url: i.json.url, body: i.json.body } }));
+`,
       { x: 960, y: 1280 },
     ),
   );
-  link('Save Blocklist', 'Send Blocklist');
+  link('Save Blocklist', 'Brand Screen Requests');
+
+  nodes.push(
+    makeNode(
+      'Send Blocklist',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
+      },
+      { typeVersion: 4.2, x: 1180, y: 1280 },
+    ),
+  );
+  link('Brand Screen Requests', 'Send Blocklist');
 
   /* --- logout branch: disconnect the Silpo account --------------------- */
   nodes.push(
@@ -1558,6 +1629,7 @@ return [{ json: {
       `
 ${READ_VAR}
 ${TELEGRAM_API}
+${UI_MODULE}
 // Two steps on purpose: /logout only asks, the button clears. Both replies are
 // built here so the branch needs a single outgoing call before the tables are
 // touched.
@@ -1569,35 +1641,24 @@ const base = { chatId: route.chatId, telegramUserId: route.telegramUserId };
 
 if (route.logoutCancel) {
   return [{ json: { ...base, confirmed: false, url: telegramApiUrl('editMessageText'), body: {
-    chat_id: route.chatId,
-    message_id: route.messageId,
-    text: '❌ Скасовано. Акаунт залишився підключеним.',
+    ...message(route.chatId, UI.logoutCancelled, { message_id: route.messageId }),
   }}}];
 }
 
 if (!route.authorized) {
   return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {
-    chat_id: route.chatId,
-    text: 'Акаунт «Сільпо» не підключений.\\n\\nЩоб підключити — /connect',
+    ...message(route.chatId, UI.logoutNotConnected),
   }}}];
 }
 
 if (route.logoutConfirm) {
   return [{ json: { ...base, confirmed: true, url: telegramApiUrl('editMessageText'), body: {
-    chat_id: route.chatId,
-    message_id: route.messageId,
-    text: '🚪 Від’єдную акаунт...',
+    ...message(route.chatId, UI.logoutWorking, { message_id: route.messageId }),
   }}}];
 }
 
 return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'), body: {
-  chat_id: route.chatId,
-  parse_mode: 'Markdown',
-  text: '🚪 *Від’єднати акаунт «Сільпо»?*\\n\\nЯ видалю збережений доступ і всі підготовлені плани. Ваш кошик і замовлення в «Сільпо» залишаться без змін.\\n\\nПісля цього можна підключити інший акаунт через /connect.\\n\\n_Список заблокованих марок збережеться._',
-  reply_markup: { inline_keyboard: [[
-    { text: '🚪 Так, від’єднати', callback_data: 'logout:yes' },
-    { text: '❌ Ні', callback_data: 'logout:no' },
-  ]] },
+  ...message(route.chatId, UI.logoutPrompt, { reply_markup: { inline_keyboard: logoutKeyboard() } }),
 }}}];
 `,
       { x: 520, y: 1440 },
@@ -1686,8 +1747,8 @@ return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'),
       'Send Logged Out',
       {
         chatId: "={{ $('Prepare Logout').first().json.chatId }}",
-        text: '✅ Акаунт від’єднано.\n\nЗбережений доступ видалено, підготовлені плани стерто. Кошик у «Сільпо» не змінювався.\n\nЩоб підключити інший акаунт — /connect',
-        additionalFields: { appendAttribution: false },
+        text: UI.logoutDone,
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       // Delete Plans emits one item per deleted row; without this the guest gets
       // one confirmation per plan they had stored.
@@ -1712,7 +1773,7 @@ return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'),
       `
 ${READ_VAR}
 ${TELEGRAM_API}
-${SELECTION_CARD}
+${UI_MODULE}
 const route = $('Merge Session').first().json;
 const rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);
 const row = rows.find(r => String(r.plan_id) === String(route.planId));
@@ -1721,7 +1782,7 @@ const row = rows.find(r => String(r.plan_id) === String(route.planId));
 if (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {
   return [{ json: { skip: true, url: telegramApiUrl('answerCallbackQuery'), body: {
     callback_query_id: route.callbackQueryId,
-    text: 'План застарів — запустіть /optimize ще раз',
+    text: UI.planGone,
   }}}];
 }
 
@@ -1736,12 +1797,7 @@ selected.sort((a, b) => a - b);
 plan.selected = selected;
 
 const card = buildSelectionCard(plan, selected);
-const body = {
-  chat_id: route.chatId,
-  message_id: route.messageId,
-  text: card.text,
-  parse_mode: 'Markdown',
-};
+const body = message(route.chatId, card.text, { message_id: route.messageId });
 if (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };
 
 return [{ json: {
@@ -1804,6 +1860,7 @@ return [{ json: {
     codeNode(
       'Validate Plan',
       `
+${UI_MODULE}
 // Data Table filters only do equality, so ownership, status and age are checked
 // here. Ownership is a security boundary: a leaked plan id must not be enough to
 // modify somebody else's cart.
@@ -1814,19 +1871,19 @@ const row = rows.find(r => String(r.plan_id) === String(route.planId));
 
 const reject = (text) => [{ json: { chatId: route.chatId, invalid: true, text } }];
 
-if (!row) return reject('⏳ План не знайдено. Запустіть /optimize ще раз.');
+if (!row) return reject(UI.planNotFound);
 if (String(row.telegram_user_id) !== String(route.telegramUserId)) {
-  return reject('⛔ Цей план належить іншому користувачу.');
+  return reject('Цей план належить іншому користувачу.');
 }
 if (row.status === 'applying') {
-  return reject('⏳ Ці зміни вже застосовуються — зачекайте кілька секунд.\\n\\nНе тисніть кнопку повторно, інакше заміни зробляться двічі.');
+  return reject('Ці зміни вже застосовуються — зачекайте кілька секунд.\\n\\nПовторне натискання зробило б заміни двічі.');
 }
 if (row.status !== 'pending') {
-  return reject('✅ Цей план уже застосований або скасований.\\n\\nЗапустіть /optimize, щоб порахувати заново.');
+  return reject(UI.planUsed);
 }
 const createdAt = new Date(row.createdAt || row.created_at || 0);
 if (Date.now() - createdAt.getTime() > PLAN_TTL_MINUTES * 60 * 1000) {
-  return reject('⏳ План застарів — ціни могли змінитися.\\n\\nЗапустіть /optimize ще раз.');
+  return reject(UI.planStale);
 }
 
 return [{ json: { ...row, invalid: false } }];
@@ -1875,7 +1932,7 @@ const vanished = chosen.length - applicable.length;
 
 if (!applicable.length) {
   return [{ json: { chatId: route.chatId, expired: true,
-    text: '🔄 Кошик змінився з моменту аналізу — жодної із запропонованих позицій у ньому вже немає.\\n\\nЗапустіть /optimize ще раз.' }}];
+    text: UI.cartMovedOn }}];
 }
 
 // Pack size is invisible until an item sits in the cart, so applying is a
@@ -2093,8 +2150,8 @@ return [{ json: {
       'Send Applying',
       {
         chatId: "={{ $('Merge Session').first().json.chatId }}",
-        text: '⏳ Застосовую зміни до кошика…',
-        additionalFields: { appendAttribution: false },
+        text: UI.applying,
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       { x: 1180, y: 240 },
     ),
@@ -2105,7 +2162,9 @@ return [{ json: {
   nodes.push(
     telegramNode(
       'Send Plan Invalid',
-      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { appendAttribution: false } },
+      // parse_mode on every node that carries UI text, whether or not today's
+      // copy happens to contain a tag: the copy changes, the node does not.
+      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
       { x: 960, y: 440 },
     ),
   );
@@ -2131,79 +2190,14 @@ return [{ json: {
       'Format Result',
       `
 ${RECEIPT_WISHES}
-// The headline demo metric is the actual cart total after the change.
+${UI_MODULE}
+// The headline number is the actual cart total after the change, read back from
+// Silpo — never the prediction the card showed.
 const result = $('Apply Changes').first().json;
-const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';
 
 if (result.expired) return [{ json: { chatId: result.chatId, text: result.text } }];
 
-let text = '🎉 *Оптимізація застосована*\\n\\n'
-  + 'Було:\\n*' + money(result.beforeTotal) + '*\\n\\n'
-  + 'Стало:\\n*' + money(result.afterTotal) + '*\\n\\n'
-  + '💰 *ФАКТИЧНО ЗЕКОНОМЛЕНО:*\\n*' + money(result.actualSaving) + '*\\n\\n'
-  + '─────────────\\n'
-  + result.applied + ' замін застосовано';
-
-if (result.failed && result.failed.length) {
-  text += '\\n\\n⚠️ *Не вдалося застосувати:*';
-  for (const item of result.failed) {
-    text += '\\n• ' + item.name + '\\n  _' + String(item.error).slice(0, 140) + '_';
-  }
-}
-// Availability and size can only be checked once the item is in the cart, so
-// these rollbacks are reported explicitly rather than hidden.
-if (result.stockRejected && result.stockRejected.length) {
-  text += '\\n\\n🚫 *Не знайшов доступної заміни:*';
-  for (const item of result.stockRejected) {
-    text += '\\n• ' + item.originalName
-      + (item.tried > 1 ? '\\n  перебрав ' + item.tried + ' варіанти — усі виявились недоступні' : '\\n  залишив оригінал');
-  }
-  text += '\\n\\n_У пошуку «Сільпо» вони значилися доступними, але кошик показав інше._'
-    + ' _Кошик тут головніший._';
-}
-if (result.sizeRejected && result.sizeRejected.length) {
-  text += '\\n\\n📦 *Не знайшов заміни того ж об\\'єму:*';
-  for (const item of result.sizeRejected) {
-    text += '\\n• ' + item.originalName + ' (' + item.originalRatio + ')'
-      + '\\n  найближче було ' + item.newRatio + ' — не підійшло'
-      + (item.tried > 1 ? ', перебрав ' + item.tried + ' варіанти' : '')
-      + '\\n  залишив оригінал';
-  }
-  // The guest cannot see why this happens only now, so say it plainly.
-  text += '\\n\\n_«Сільпо» не показує об\\'єм упаковки в пошуку — я бачу його лише тоді,'
-    + ' коли товар уже в кошику. Тому перевіряю після додавання: менша упаковка за меншу ціну'
-    + ' це не економія, адже двох таких коштуватимуть дорожче за оригінал._';
-}
-if (result.vanished) {
-  text += '\\n↩️ ' + result.vanished + ' позицій уже не було в кошику';
-}
-if (result.deselected) {
-  text += '\\n☐ ' + result.deselected + ' замін ви не обрали';
-}
-// The card showed one product; the cart proved it wrong and a runner-up went in
-// instead. Saying which keeps the message honest about what was bought.
-if (result.substituted && result.substituted.length) {
-  text += '\\n\\n🔄 *Підставив інший товар:*';
-  for (const item of result.substituted) {
-    text += '\\n• замість ' + item.planned + '\\n  взяв ' + item.used;
-  }
-}
-if (Math.abs(result.actualSaving - result.promisedSaving) > 1) {
-  text += '\\n\\n_Фактична економія відрізняється від прогнозу — ціни або наявність змінилися._';
-}
-const bonus = result.loyalty && result.loyalty.bonusAvailable;
-if (bonus > 0) {
-  text += '\\n\\n💳 Балабонуси: ' + bonus + ' грн — застосуйте при оформленні.';
-}
-const errors = (result.validations || []).filter(v => v.level === 'error');
-if (errors.length) {
-  text += '\\n\\n⚠️ Кошик потребує уваги: ' + errors.map(e => e.message).join(', ');
-}
-
-// Labelled so it reads as the receipt-style closing line it is, rather than a
-// stray remark. Not attributed to Silpo: these texts are ours.
-text += '\\n\\n─────────────\\n🧾 *Побажання до вашого чека*\\n_'
-  + pickWish(result.actualSaving, result.applied) + '_';
+const text = buildResultText(result, pickWish(result.actualSaving, result.applied));
 
 return [{ json: { chatId: result.chatId, text } }];
 `,
@@ -2212,61 +2206,97 @@ return [{ json: { chatId: result.chatId, text } }];
   );
   link('Mark Plan Applied', 'Format Result');
 
-  nodes.push(telegramNode('Send Result', { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'Markdown', appendAttribution: false } }, { x: 1400, y: 320 }));
+  nodes.push(
+    telegramNode(
+      'Send Result',
+      {
+        chatId: '={{ $json.chatId }}',
+        text: '={{ $json.text }}',
+        // Closes the loop: the obvious next question after "what changed?" is
+        // "what does the cart look like now?".
+        replyMarkup: 'inlineKeyboard',
+        inlineKeyboard: {
+          rows: [{ row: { buttons: [{ text: BUTTON.cart, additionalFields: { type: 'callback_data', callback_data: 'cart:' } }] } }],
+        },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+      },
+      { x: 1400, y: 320 },
+    ),
+  );
   link('Format Result', 'Send Result');
 
   /* --- cancel, help, errors ------------------------------------------- */
   nodes.push(
     telegramNode(
       'Send Cancelled',
-      { chatId: '={{ $json.chatId }}', text: '❌ Скасовано. Кошик не змінювався.\n\nЗапустіть /optimize, коли будете готові.', additionalFields: { appendAttribution: false } },
+      { chatId: '={{ $json.chatId }}', text: UI.cancelled, additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
       { x: 520, y: 520 },
     ),
   );
   link('Switch Action', 'Send Cancelled', 3);
 
-  nodes.push(
-    codeNode(
-      'Build Help',
-      `
-// The command list reflects what the guest can actually do right now: /logout
-// makes no sense before an account is connected, so it only appears afterwards.
+  /* --- navigation screens: home, settings, about ----------------------- */
+  //
+  // The three of them share one send node. Each builds a card, turns it into
+  // Bot API requests and hands them over; navigation edits the tapped message
+  // rather than appending a new one, so the chat does not fill with dead menus.
+  const screenNode = (name: string, code: string, y: number) => {
+    nodes.push(
+      codeNode(
+        name,
+        `
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
 const route = $('Merge Session').first().json;
-
-let text = '👋 Вітаю! Я допоможу зменшити вартість вашого кошика «Сільпо», не змінюючи його суті.\\n\\n*Основне*\\n';
-text += route.authorized
-  ? '/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n/logout — від’єднати акаунт (щоб підключити інший)\\n'
-  : '/connect — підключити акаунт Сільпо\\n/cart — показати кошик\\n/optimize — знайти, де можна зекономити\\n';
-text += '\\n*Якщо якусь марку не хочете бачити в замінах*\\n/blocked — ваш список винятків\\n/block + назва марки — не пропонувати її\\n/unblock + назва марки — повернути\\n\\n';
-text += '_Назву марки я показую під кожною заміною, тож її можна просто скопіювати._\\n\\n';
-text += 'Я шукаю дешевші аналоги, акції, купони та балабонуси — і нічого не змінюю без вашого підтвердження.';
-
-return [{ json: { chatId: route.chatId, text } }];
+const ctx = { chatId: route.chatId, messageId: route.messageId, callbackQueryId: route.callbackQueryId };
+${code}
+return screenRequests(card, ctx).map(r => ({ json: { url: telegramApiUrl(r.method), body: r.body } }));
 `,
-      { x: 520, y: 660 },
-    ),
+        { x: 520, y },
+      ),
+    );
+    link(name, 'Send Screen');
+  };
+
+  screenNode('Build Home', 'const card = buildHomeCard(route.authorized);', 660);
+  screenNode(
+    'Build Settings',
+    'const card = buildSettingsCard(route.authorized, (route.blockedBrands || []).length);',
+    780,
   );
-  // The fallback output sits after every rule, so it shifts whenever one is added.
-  link('Switch Action', 'Build Help', 11);
+  screenNode('Build About', 'const card = buildAboutCard();', 900);
+  screenNode('Show Brands', 'const card = buildBrandsCard(route.blockedBrands || []);', 1020);
+
+  // /start and anything unrecognised land on home. The fallback output sits
+  // after every rule, so its index shifts whenever a rule is added.
+  link('Switch Action', 'Build Home', 15);
+  link('Switch Action', 'Build Home', 16);
+  link('Switch Action', 'Build Settings', 11);
+  link('Switch Action', 'Build About', 12);
+  link('Switch Action', 'Show Brands', 9);
 
   nodes.push(
-    telegramNode(
-      'Send Help',
+    makeNode(
+      'Send Screen',
+      'n8n-nodes-base.httpRequest',
       {
-        chatId: '={{ $json.chatId }}',
-        text: '={{ $json.text }}',
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
       },
-      { x: 740, y: 660 },
+      { typeVersion: 4.2, x: 800, y: 780 },
     ),
   );
-  link('Build Help', 'Send Help');
 
   nodes.push(
     dataTableNode(
       'Load Plan Details',
       { operation: 'get', table: TABLES.plans, filters: [{ keyName: 'plan_id', keyValue: '={{ $json.planId }}' }] },
-      { x: 520, y: 800, alwaysOutputData: true },
+      { x: 520, y: 1140, alwaysOutputData: true },
     ),
   );
   link('Switch Action', 'Load Plan Details', 4);
@@ -2275,51 +2305,27 @@ return [{ json: { chatId: route.chatId, text } }];
     codeNode(
       'Format Details',
       `
-// Full breakdown behind the "details" button. Ownership is re-checked here for
-// the same reason as in Validate Plan: a plan id alone must not reveal another
-// customer's cart.
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
+// Full breakdown behind the «Деталі» button — the per-item reasoning the card
+// deliberately leaves out. Ownership is re-checked here for the same reason as
+// in Validate Plan: a plan id alone must not reveal another customer's cart.
 const route = $('Merge Session').first().json;
 const rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);
 const row = rows.find(r => String(r.plan_id) === String(route.planId));
 
 if (!row || String(row.telegram_user_id) !== String(route.telegramUserId)) {
-  return [{ json: { chatId: route.chatId,
-    text: '⏳ План не знайдено або він застарів.\\n\\nЗапустіть /optimize ще раз.' }}];
+  return [{ json: { url: telegramApiUrl('sendMessage'), body: {
+    ...message(route.chatId, UI.planNotFound) } }}];
 }
 
 const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
-const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';
-const replacements = plan.replacements || [];
+const card = buildDetailsCard(plan, row.plan_id);
 
-const blocks = replacements.map((r, i) =>
-  (i + 1) + '. *' + r.originalName + '*\\n'
-  + '   ' + money(r.originalPrice) + (r.quantity > 1 ? ' × ' + r.quantity : '') + '\\n'
-  + '   ↓\\n'
-  + '   *' + r.replacementName + '*\\n'
-  + '   ' + money(r.replacementPrice) + (r.onPromotion ? '  🎁 акція' : '') + '\\n'
-  + '   💰 економія ' + money(r.saving) + ' (−' + r.savingPct + '%)'
-  + (r.aiReason ? '\\n   💬 ' + r.aiReason : '')
-  + (r.verifySize ? '\\n   ⚠️ перевірте об\\'єм упаковки' : ''));
-
-let text = '🔍 *Деталі оптимізації*\\n\\n'
-  + 'Було: ' + money(plan.summary.originalTotal) + '\\n'
-  + 'Стане: ' + money(plan.summary.originalTotal - plan.summary.saving) + '\\n'
-  + '💰 Економія: *' + money(plan.summary.saving) + '*\\n\\n'
-  + '─────────────\\n\\n';
-
-// Telegram caps a message at 4096 characters.
-const LIMIT = 3900;
-const kept = [];
-for (const block of blocks) {
-  if ((text + kept.join('\\n\\n') + block).length > LIMIT) break;
-  kept.push(block);
-}
-text += kept.join('\\n\\n');
-if (kept.length < blocks.length) {
-  text += '\\n\\n_…і ще ' + (blocks.length - kept.length) + ' замін — не вмістилися в повідомлення._';
-}
-
-return [{ json: { chatId: route.chatId, planId: row.plan_id, text } }];
+return [{ json: { url: telegramApiUrl('sendMessage'), body: {
+  ...message(route.chatId, card.text, { reply_markup: { inline_keyboard: card.keyboard } }),
+} }}];
 `,
       { x: 740, y: 800 },
     ),
@@ -2327,27 +2333,18 @@ return [{ json: { chatId: route.chatId, planId: row.plan_id, text } }];
   link('Load Plan Details', 'Format Details');
 
   nodes.push(
-    telegramNode(
+    makeNode(
       'Send Details',
+      'n8n-nodes-base.httpRequest',
       {
-        chatId: '={{ $json.chatId }}',
-        text: '={{ $json.text }}',
-        replyMarkup: 'inlineKeyboard',
-        inlineKeyboard: {
-          rows: [
-            {
-              row: {
-                buttons: [
-                  { text: '✅ Застосувати', additionalFields: { type: 'callback_data', callback_data: '=apply:{{ $json.planId }}' } },
-                  { text: '❌ Скасувати', additionalFields: { type: 'callback_data', callback_data: '=cancel:{{ $json.planId }}' } },
-                ],
-              },
-            },
-          ],
-        },
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
       },
-      { x: 960, y: 800 },
+      { typeVersion: 4.2, x: 960, y: 800 },
     ),
   );
   link('Format Details', 'Send Details');
@@ -2359,10 +2356,11 @@ return [{ json: { chatId: route.chatId, planId: row.plan_id, text } }];
       `
 ${MCP_CLIENT}
 
+${UI_MODULE}
+
 const route = $('Merge Session').first().json;
 if (!route.authorized) {
-  return [{ json: { chatId: route.chatId, empty: true,
-    text: '👋 Спершу підключіть акаунт «Сільпо» — інакше я не побачу ваш кошик.\\n\\nНатисніть /connect' }}];
+  return [{ json: { chatId: route.chatId, empty: true, text: UI.connectFirst }}];
 }
 
 const mcp = createMcp(route.session);
@@ -2370,46 +2368,22 @@ const { shoppingCartId } = await mcp.call('silpo_get_my_shopping_cart', {});
 const response = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId });
 const cart = response.cart;
 const items = cart.shipments.flatMap(s => s.products);
-const money = n => Number(n).toFixed(2).replace('.', ',') + ' грн';
 
 if (!items.length) {
-  return [{ json: { chatId: route.chatId, empty: true,
-    text: '🛒 Ваш кошик порожній.\\n\\nНаповніть його в застосунку «Сільпо» — і я перевірю, де можна зекономити.' }}];
-}
-
-// Telegram caps a message at 4096 characters.
-const shown = items.slice(0, 30);
-const lines = shown.map((item, i) =>
-  (i + 1) + '. ' + item.name + '\\n'
-  + '   ' + money(item.price) + (item.quantity > 1 ? ' × ' + item.quantity : '')
-  + (item.ratio ? '  ·  ' + item.ratio : '')
-  + (item.oldPrice ? '  🎁 було ' + money(item.oldPrice) : ''));
-
-let text = '🛒 *Ваш кошик*\\n'
-  + items.length + ' товарів на *' + money(cart.calculation.total) + '*\\n\\n'
-  + lines.join('\\n');
-
-if (items.length > shown.length) {
-  text += '\\n\\n_…і ще ' + (items.length - shown.length) + ' позицій._';
-}
-
-const discount = cart.calculation.subDiscount;
-if (discount > 0) {
-  text += '\\n\\n🎁 Знижок уже враховано: ' + money(discount);
-}
-
-const loyalty = response.loyalty || {};
-if (loyalty.bonusAvailable > 0) {
-  text += '\\n💳 Балабонуси: ' + loyalty.bonusAvailable + ' грн';
+  return [{ json: { chatId: route.chatId, empty: true, text: UI.cartEmpty }}];
 }
 
 // An expired slot also makes Silpo report every line as out of stock.
 const slotBroken = (cart.calculation.validations || []).some(v => v.level === 'error' && v.type === 'timeslot');
-if (slotBroken) {
-  text += '\\n\\n⏰ _Слот доставки протух — оберіть новий у застосунку, інакше кошик не оформиться._';
-}
+const loyalty = response.loyalty || {};
 
-return [{ json: { chatId: route.chatId, empty: false, text } }];
+const card = buildCartCard(items, cart.calculation.total, {
+  discount: cart.calculation.subDiscount,
+  bonusAvailable: loyalty.bonusAvailable,
+  slotBroken,
+});
+
+return [{ json: { chatId: route.chatId, empty: false, text: card.text } }];
 `,
       { x: 520, y: 960, onError: 'continueErrorOutput' },
     ),
@@ -2443,7 +2417,7 @@ return [{ json: { chatId: route.chatId, empty: false, text } }];
       {
         chatId: '={{ $json.chatId }}',
         text: '={{ $json.text }}',
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       { x: 960, y: 1100 },
     ),
@@ -2461,12 +2435,12 @@ return [{ json: { chatId: route.chatId, empty: false, text } }];
           rows: [
             {
               row: {
-                buttons: [{ text: '🔍 Оптимізувати кошик', additionalFields: { type: 'callback_data', callback_data: 'optimize:' } }],
+                buttons: [{ text: BUTTON.optimize, additionalFields: { type: 'callback_data', callback_data: 'optimize:' } }],
               },
             },
           ],
         },
-        additionalFields: { parse_mode: 'Markdown', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
       },
       { x: 960, y: 900 },
     ),
@@ -2477,30 +2451,26 @@ return [{ json: { chatId: route.chatId, empty: false, text } }];
     codeNode(
       'Handle Error',
       `
+${UI_MODULE}
 // Never leak a stack trace to the customer — map failures to plain guidance.
 const failure = $input.first().json;
 const raw = String((failure.error && failure.error.message) || failure.message || '');
 const route = $('Merge Session').first().json;
 
-let text;
-if (raw.includes('SILPO_REAUTH_REQUIRED') || raw.includes('REAUTH')) {
-  text = '🔐 Доступ до акаунта «Сільпо» втратив силу.\\n\\nНатисніть /connect, щоб увійти знову.';
-} else if (raw.includes('SILPO_FORBIDDEN')) {
-  text = '⛔ Немає доступу до цієї операції у вашому акаунті «Сільпо».';
-} else if (raw.includes('SILPO_MCP_ERROR_429')) {
-  text = '⏳ Забагато запитів до «Сільпо». Зачекайте хвилину і спробуйте ще раз.';
-} else if (raw.includes('SILPO_MCP_ERROR_5') || raw.includes('SILPO_EMPTY_RESPONSE')) {
-  text = '🔧 Сервіс «Сільпо» тимчасово недоступний. Спробуйте за кілька хвилин.';
-} else if (raw.includes('TOKEN_ENCRYPTION_KEY')) {
-  text = '⚙️ Помилка конфігурації бота. Зверніться до адміністратора.';
-} else if (raw.includes('TOOL_ERROR')) {
-  text = '🛒 «Сільпо» не змогло виконати операцію з кошиком.\\n\\nПеревірте кошик у застосунку та спробуйте ще раз.';
-} else {
+let kind = 'unknown';
+if (raw.includes('SILPO_REAUTH_REQUIRED') || raw.includes('REAUTH')) kind = 'auth';
+else if (raw.includes('SILPO_FORBIDDEN')) kind = 'forbidden';
+else if (raw.includes('SILPO_MCP_ERROR_429')) kind = 'rate';
+else if (raw.includes('SILPO_MCP_ERROR_5') || raw.includes('SILPO_EMPTY_RESPONSE')) kind = 'upstream';
+else if (raw.includes('TOKEN_ENCRYPTION_KEY')) kind = 'config';
+else if (raw.includes('TOOL_ERROR')) kind = 'cart';
+
+let text = buildErrorText(kind);
+if (kind === 'unknown') {
   // Not a stack trace, but enough to identify the failure without digging
   // through Executions. Unknown errors are the ones worth surfacing.
   const hint = raw.replace(/\\s+/g, ' ').slice(0, 120);
-  text = '😔 Щось пішло не так. Спробуйте ще раз через /optimize.'
-    + (hint ? '\\n\\n_' + hint + '_' : '');
+  if (hint) text += '\\n\\n<i>' + esc(hint) + '.</i>';
 }
 return [{ json: { chatId: route.chatId, text } }];
 `,
@@ -2532,7 +2502,7 @@ return [{ json: { chatId: route.chatId, text } }];
   nodes.push(
     telegramNode(
       'Send Error',
-      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'Markdown', appendAttribution: false } },
+      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
       { x: 1180, y: 660 },
     ),
   );
@@ -2686,7 +2656,19 @@ return [{ json: {
   nodes.push(
     telegramNode(
       'Notify Connected',
-      { chatId: "={{ $('Exchange Code').first().json.chat_id }}", text: '✅ Акаунт «Сільпо» підключено!\n\nТепер натисніть /optimize — і я перевірю ваш кошик.', additionalFields: { appendAttribution: false } },
+      {
+        chatId: "={{ $('Exchange Code').first().json.chat_id }}",
+        text: UI.connected,
+        // The one action worth taking next, as a button: the guest has just come
+        // back from a browser and should not have to find a command.
+        replyMarkup: 'inlineKeyboard',
+        inlineKeyboard: {
+          rows: [
+            { row: { buttons: [{ text: BUTTON.optimize, additionalFields: { type: 'callback_data', callback_data: 'optimize:' } }] } },
+          ],
+        },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+      },
       { x: 1320, y: -100 },
     ),
   );
@@ -2699,7 +2681,7 @@ return [{ json: {
       {
         respondWith: 'text',
         responseBody:
-          '<!doctype html><meta charset="utf-8"><body style="font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0"><div style="text-align:center"><div style="font-size:56px">✅</div><h2>Акаунт підключено</h2><p>Поверніться в Telegram.</p></div></body>',
+          '<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><body style="font:16px/1.5 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0f1115;color:#e7e9ee"><div style="text-align:center;max-width:22rem;padding:2rem"><div style="width:44px;height:44px;margin:0 auto 1.5rem;border-radius:50%;border:1.5px solid #3ecf8e;display:grid;place-items:center;color:#3ecf8e;font-size:20px">✓</div><h1 style="font-size:1.25rem;font-weight:600;margin:0 0 .5rem">Акаунт підключено</h1><p style="margin:0;opacity:.6">Поверніться в Telegram — усе готово.</p></div></body>',
         options: { responseCode: 200, responseHeaders: { entries: [{ name: 'content-type', value: 'text/html; charset=utf-8' }] } },
       },
       { typeVersion: 1.1, x: 1540, y: -100 },
@@ -2714,7 +2696,7 @@ return [{ json: {
       {
         respondWith: 'text',
         responseBody:
-          '={{ "<!doctype html><meta charset=\\"utf-8\\"><body style=\\"font:16px system-ui;display:grid;place-items:center;height:100vh;margin:0\\"><div style=\\"text-align:center\\"><div style=\\"font-size:56px\\">⚠️</div><h2>Не вдалося підключити</h2><p>" + $json.message + "</p></div></body>" }}',
+          '={{ "<!doctype html><meta charset=\\"utf-8\\"><meta name=\\"viewport\\" content=\\"width=device-width,initial-scale=1\\"><body style=\\"font:16px/1.5 system-ui,-apple-system,sans-serif;display:grid;place-items:center;min-height:100vh;margin:0;background:#0f1115;color:#e7e9ee\\"><div style=\\"text-align:center;max-width:22rem;padding:2rem\\"><div style=\\"width:44px;height:44px;margin:0 auto 1.5rem;border-radius:50%;border:1.5px solid #d0763a\\"></div><h1 style=\\"font-size:1.25rem;font-weight:600;margin:0 0 .5rem\\">Не вдалося підключити</h1><p style=\\"margin:0;opacity:.6\\">" + $json.message + "</p></div></body>" }}',
         options: { responseCode: 400, responseHeaders: { entries: [{ name: 'content-type', value: 'text/html; charset=utf-8' }] } },
       },
       { typeVersion: 1.1, x: 880, y: 120 },

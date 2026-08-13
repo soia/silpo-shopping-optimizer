@@ -132,6 +132,99 @@ against the next account's cart.
 Silpo exposes no revocation endpoint, so this removes our stored copy of the
 token rather than invalidating it at the provider.
 
+### Presentation layer
+
+Everything the guest reads lives in `src/lib/ui.ts` and nowhere else. It is
+inlined into the Code nodes exactly the way `optimizer.ts` is, and `build.ts`
+imports the same module for the handful of messages that sit in Telegram node
+parameters. One copy of every string, one place to change the wording.
+
+Copy is ordinary TypeScript source there, so a newline is `\n` and an apostrophe
+needs no escape — the double-escaping trap that applies to code written inside
+the generator's template literals does not apply to text.
+
+Business logic stays where it was: the module receives numbers already computed
+by `optimizer.ts` and formats them. It performs no arithmetic beyond the
+percentage shown next to a total.
+
+### Screens, not messages
+
+The bot is built as a small app rather than a chat script, using the three
+surfaces Telegram actually provides:
+
+| Surface | Carries |
+|---|---|
+| Persistent reply keyboard | Оптимізувати · Мій кошик · Налаштування — always visible |
+| Command menu (`setMyCommands`) | every command, as a fallback nobody has to read |
+| Inline buttons | the actions belonging to the screen on display |
+
+No screen prints a command. `npm run setup:commands` registers them with the Bot
+API instead, which is why the home screen is four lines rather than fourteen.
+
+Navigation — home ⇄ settings ⇄ about ⇄ brands — **edits the message that was
+tapped** (`screenRequests` chooses `editMessageText` when a callback is present,
+`sendMessage` otherwise). The chat therefore holds one live screen instead of a
+stack of dead menus. Results, cards and errors still send: they are records of
+something that happened, not navigation.
+
+Two Telegram constraints shape the rest:
+
+- **One `reply_markup` per message.** The persistent keyboard cannot ride on a
+  screen that has inline buttons, so it is attached to the progress line — the
+  one message every guest passes through that needs no buttons of its own.
+- **A callback must be answered** or the button spins for half a minute, which
+  reads as a hang. `Build Ack` answers every tap the moment it arrives; the
+  screens that show a toast (`Ascania повернуто в пошук`) answer their own,
+  since Telegram accepts one answer per query.
+
+### Reading a fifteen-item list
+
+The cart screen is the one that has to survive real data, and the rules that make
+it readable apply to every list in the bot:
+
+- **Fixed rhythm.** Every item is exactly two lines. A name that wraps onto a
+  third collides with the price beneath it and the price stops being a column.
+  Long names are clipped at a word — except when two clipped names collide, as
+  four «Напій сокoвмісний Моршинська …» do, in which case those items keep their
+  full name. Ambiguity is a property of the list, not of one name.
+- **One bold element per line.** The price. Everything else recedes around it.
+- **Numbers explain each other.** The line reads like a shelf label — the price
+  you pay, then the price you would have paid, struck out. This is why the
+  screens are `parse_mode: 'HTML'`: legacy Markdown has no strikethrough, and
+  every alternative («акція, було 299,00» on all fifteen lines, or a bare
+  «🎁 −100,00 ₴») was either repetition or a puzzle. Where a number has no
+  partner to explain it, it gets a word instead: «економія 14,00 ₴».
+- **Emoji mark, they do not decorate.** One at the head of a screen title or
+  section, one as a status marker on a line: 🎁 promotion, 💰 saving, 💳 bonuses,
+  ⏰ expired slot, 📦 pack size. Never two on one line — the render harness fails
+  the build if that creeps back in.
+
+### Enforcing all of this
+
+Prose rules decay. These are executable: `src/workflow/screens.ts` loads the UI
+module **out of the generated workflow JSON** — never from the TypeScript source,
+since only what was emitted proves anything — renders every screen against
+fixtures taken from real carts, and asserts the rules above. It runs inside
+`npm run check`.
+
+Each assertion exists because the defect it catches shipped at least once:
+
+| Assertion | The defect |
+|---|---|
+| every body goes through `message()` | `Build Progress` sent `<b>Аналізую кошик…</b>` with the tags showing |
+| every Telegram node sets `parse_mode` | the same omission, in node parameters instead of code |
+| tags closed, `<`/`&` escaped | a product name would make Telegram reject the whole send |
+| one emoji per line | `💰 −8,00 ₴ · 🎁` |
+| items all the same height | wrapped names collided with the price line |
+| no two clipped lines identical | four «Напій сокoвмісний Моршинська …» rendered the same |
+| every entry point reaches a wired branch | the fallback index shifts when a switch rule is added |
+| no action wired to two branches | `/blocked` drew its screen twice |
+
+Adding a brand goes through a `force_reply` prompt: the guest types a name, not a
+command with an argument. `Route Request` recognises the reply by matching
+`reply_to_message.text` against `BRAND_PROMPT_MARKER`, which is derived from the
+prompt itself so the two cannot drift apart.
+
 ### Why not the built-in n8n MCP node
 
 The MCP Client node holds one static credential per workflow, which means one
