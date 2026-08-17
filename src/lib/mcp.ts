@@ -9,7 +9,7 @@
  * instead of the local `.secrets` file).
  */
 
-import { readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -49,12 +49,30 @@ export interface CallStats {
 
 export const stats: CallStats = { calls: 0, retries: 0, refreshes: 0 };
 
-let auth: StoredAuth = JSON.parse(readFileSync(AUTH_FILE, 'utf8'));
+let auth: StoredAuth | null = null;
 let initialized = false;
+
+/**
+ * Reads the stored tokens on first use rather than at import time.
+ *
+ * authorize.ts imports this module for its constants while creating the very
+ * file the tokens live in, so loading eagerly made that command fail with an
+ * ENOENT before it could write anything.
+ */
+function loadAuth(): StoredAuth {
+  if (!auth) {
+    if (!existsSync(AUTH_FILE)) {
+      throw new Error('Not authorized yet — run `npm run authorize` first');
+    }
+    auth = JSON.parse(readFileSync(AUTH_FILE, 'utf8')) as StoredAuth;
+  }
+  return auth;
+}
 
 /** Exchanges the refresh token for a fresh access token and persists it. */
 async function refreshToken(): Promise<void> {
-  if (!auth.refresh_token) {
+  const current = loadAuth();
+  if (!current.refresh_token) {
     throw new Error('No refresh token available — run `npm run authorize` again');
   }
   const res = await fetch(TOKEN_URL, {
@@ -62,8 +80,8 @@ async function refreshToken(): Promise<void> {
     headers: { 'content-type': 'application/x-www-form-urlencoded' },
     body: new URLSearchParams({
       grant_type: 'refresh_token',
-      refresh_token: auth.refresh_token,
-      client_id: auth.client_id,
+      refresh_token: current.refresh_token,
+      client_id: current.client_id,
       resource: MCP_URL,
     }),
   });
@@ -71,9 +89,9 @@ async function refreshToken(): Promise<void> {
 
   const token = (await res.json()) as { access_token: string; refresh_token?: string; expires_in?: number };
   auth = {
-    ...auth,
+    ...current,
     access_token: token.access_token,
-    refresh_token: token.refresh_token ?? auth.refresh_token,
+    refresh_token: token.refresh_token ?? current.refresh_token,
     expires_at: Date.now() + (token.expires_in ?? 3600) * 1000,
   };
   writeFileSync(AUTH_FILE, JSON.stringify(auth, null, 2), { mode: 0o600 });
@@ -88,7 +106,7 @@ async function rpc(method: string, params: unknown, id = Math.floor(Math.random(
       headers: {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
-        authorization: `Bearer ${auth.access_token}`,
+        authorization: `Bearer ${loadAuth().access_token}`,
         'mcp-protocol-version': PROTOCOL_VERSION,
       },
       body: JSON.stringify({ jsonrpc: '2.0', id, method, params }),

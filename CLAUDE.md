@@ -33,13 +33,41 @@ failed immediately.)
 
 Same for parameters: check `inputSchema.required` before writing a call.
 
-## 3. The model never produces a number
+## 3. The model decides; code does the arithmetic
 
-All arithmetic — prices, savings, totals, percentages — happens in deterministic
-code in `src/lib/optimizer.ts`. Prices originate exclusively from MCP responses.
+This rule has been reversed twice. It first read "the model never produces a
+number". It was then inverted to give the model the arithmetic as well. Measurement
+put it back, and this is where it stays:
 
-The semantic layer returns `accept` / `confidence` / `reason` and nothing else.
-When adding a model step, recompute every total after it, in code.
+**Every judgement is the model's. Every multiplication is code's.**
+
+The model chooses which candidate replaces a line, whether the purchase intent
+survives, and whether the pack size is acceptable. It reads prices to do that.
+It returns `chosen` / `accept` / `confidence` / `reason` / `verifySize` /
+`alternates` — indices and words, no figures. `computeSaving()` and `buildPlan()`
+in `src/lib/ai-ranker.ts` produce every number from MCP prices.
+
+Why, with the measurement that settled it: on a live 22-item cart the model got
+**2 of 16 savings wrong, both on weighted lines** — a 0.3 kg line came back as
+`1.32` instead of `132.00`, and its plan total was **123.64 UAH short of the sum
+of its own lines**. On a 14-item cart with one weighted line it had been exact
+twice, which is why the defect stayed hidden. After the change: 17 of 17 lines,
+all percentages and all totals exact.
+
+Removing the arithmetic also removed a model call per run (totals) and shrank the
+response schema.
+
+What remains true from the all-model era:
+
+- **Results are not reproducible.** The model picks a different candidate between
+  runs; measured spreads of 6-40% on identical input. Quote a range, never a
+  single figure.
+- There is **no rule-based fallback** for selection. An API failure raises
+  `AIUnavailableError` (prefix `AI unavailable`) and the run stops. `mapLimit`
+  flattens rejections to strings, which is why that prefix exists.
+- The one deliberate silent fallback is the receipt wish: it carries no number
+  and is written after the cart has already changed, so a static line is less
+  personal, not wrong.
 
 ## 4. Code inside template literals is two layers deep
 
@@ -65,7 +93,7 @@ test the emitted code, not the source.
 
 ## 5. One source of truth for the engine — and for the copy
 
-`src/lib/optimizer.ts` (engine) and `src/lib/ui.ts` (every guest-facing string
+`src/lib/ai-ranker.ts` (engine) and `src/lib/ui.ts` (every guest-facing string
 and keyboard) are transpiled and inlined into the n8n Code nodes by
 `src/workflow/build.ts`.
 
@@ -73,6 +101,13 @@ and keyboard) are transpiled and inlined into the n8n Code nodes by
 - Change logic in `src/lib/`, then `npm run build:workflows`.
 - Finish with `npm run check` (typecheck → build → validate → screens) before
   calling anything done.
+
+The engine reaches the network through an injectable fetcher. The Code-node
+sandbox has no global `fetch`, so `Optimize Cart` calls `setFetcher(httpFetch)`
+before using it; Node uses the default. Anything added to that module must stay
+transport-agnostic, and must not declare a top-level name the inlined helpers
+already use — `sleep` collided once and the node failed to compile. `npm run
+validate` catches that class of collision; nothing else does.
 
 `npm run preview` renders every screen out of the generated JSON the way Telegram
 paints it — bold, italic, struck-through, buttons. **Look at it after any change
@@ -275,14 +310,20 @@ the `Handle Error` node.
   `client_secret`), so no application needs manual registration.
 - The MCP server is **stateless** — it issues no `Mcp-Session-Id`.
 - Responses may be `application/json` *or* `text/event-stream`; both are parsed.
-- **Pack size for candidates is unavailable.** `ratio` exists only on cart lines.
-  Every product-returning tool was scanned — search, details, sets, favorites,
-  order history — and none carries it. silpo.ua shows it, but that is the
-  storefront's own API, which the rules exclude.
+- **Pack size for candidates is available since silpo-mcp-service v1.108.0.**
+  Search results, `get_products`, `get_product_details`, `similar_products` and
+  favorites carry **`displayRatio`** ("180г", "1,5л") — verified live on 19 of 19
+  candidates from `similar_products`, not taken from the tool description. Cart
+  lines still use `ratio`; candidates have no `ratio` at all, so read both.
+  This lifted what used to be the engine's main quality ceiling: the four
+  «Моршинська» lines that previously attracted a smaller-pack "bargain" now get
+  no replacement, because the model can see the pack differs.
+  The earlier note here claimed `sizeOf()` would pick the field up "with no
+  other change". That was wrong — `sizeOf()` reads `ratio`, so the field has to
+  be read explicitly. Selection now compares the raw strings in the prompt and
+  does not parse them at all.
 - Silpo reuses one product name across pack sizes, so an identical name with a
-  materially lower price means a smaller pack rather than a bargain. This is the main quality ceiling — if
-  `displayRatio` ever appears in search results, `sizeOf()` picks it up with no
-  other change.
+  materially lower price means a smaller pack rather than a bargain.
 - `similar_products` returns the original product itself as a candidate; always
   filter on `candidate.id !== original.productId`.
 - `get_promotions` returns campaign codes, not per-product discounts. A specific

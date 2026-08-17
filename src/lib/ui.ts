@@ -267,6 +267,7 @@ export const BUTTON = {
   cart: '🛒 Мій кошик',
   settings: '⚙️ Налаштування',
   brands: '🚫 Марки, які не пропонувати',
+  sizes: '📦 Різниця в фасуванні',
   brandAdd: '+ Додати марку',
   brandRemove: '✕',
   about: 'Як це працює',
@@ -352,12 +353,13 @@ export function buildHomeCard(authorized: boolean): Card {
  * Each row states its current value rather than only its name, so the screen
  * answers "what is set right now" without a further tap.
  */
-export function buildSettingsCard(authorized: boolean, blockedCount: number): Card {
+export function buildSettingsCard(authorized: boolean, blockedCount: number, tolerance?: string | null): Card {
   const brandsRow = blockedCount
     ? BUTTON.brands + ' · ' + blockedCount
     : BUTTON.brands;
 
   const keyboard: Keyboard = [[{ text: brandsRow, callback_data: 'brands:' }]];
+  keyboard.push([{ text: BUTTON.sizes + ' · ' + toleranceLabel(tolerance), callback_data: 'sizes:' }]);
   keyboard.push([{ text: BUTTON.about, callback_data: 'about:' }]);
   keyboard.push([
     authorized
@@ -370,7 +372,8 @@ export function buildSettingsCard(authorized: boolean, blockedCount: number): Ca
     text:
       '⚙️ <b>Налаштування</b>\n\n' +
       '👤 Акаунт «Сільпо»: ' + (authorized ? 'підключено' : 'не підключено') + '\n' +
-      '🚫 Марок у винятках: ' + blockedCount,
+      '🚫 Марок у винятках: ' + blockedCount + '\n' +
+      '📦 Різниця в фасуванні: ' + toleranceLabel(tolerance),
     keyboard,
   };
 }
@@ -382,6 +385,49 @@ export function buildSettingsCard(authorized: boolean, blockedCount: number): Ca
  * change before they tap Apply, and because the pack-size caveat is easier to
  * accept when it was explained once, calmly, rather than only at rollback time.
  */
+/**
+ * How much the pack size may differ, as three presets.
+ *
+ * Presets rather than a number the guest types: a free-form value needs parsing,
+ * validation and an error path, and «0.8» means nothing to a shopper. Each option
+ * says what it does in the words of the thing being bought.
+ *
+ * The percentages here are derived from the same table the engine enforces, so
+ * the screen cannot drift from the behaviour.
+ */
+export const TOLERANCE_OPTIONS: Array<{ key: string; label: string; hint: string }> = [
+  { key: 'strict', label: 'Строго', hint: 'тільки те саме фасування' },
+  { key: 'normal', label: 'Звичайно', hint: 'до чверті більше або менше' },
+  { key: 'loose', label: 'Вільно', hint: 'помітно інше фасування, якщо ціна за 100 г краща' },
+];
+
+export function toleranceLabel(tolerance?: string | null): string {
+  const found = TOLERANCE_OPTIONS.find((o) => o.key === (tolerance || 'normal'));
+  return found ? found.label.toLowerCase() : 'звичайно';
+}
+
+export function buildSizesCard(tolerance?: string | null, notice?: string): Card {
+  const active = tolerance || 'normal';
+
+  let text =
+    '📦 <b>Різниця в фасуванні</b>\n\n' +
+    'Наскільки заміна може відрізнятися за обсягом або вагою від того, що у вашому кошику.\n\n';
+  text += TOLERANCE_OPTIONS.map(
+    (o) => (o.key === active ? '● ' : '○ ') + b(o.label) + ' — ' + o.hint,
+  ).join('\n');
+  text +=
+    '\n\n' +
+    i('Менша упаковка за меншу ціну — це не економія, тому за будь-якого налаштування я порівнюю ціну за однакову кількість.');
+  if (notice) text += '\n\n' + i(notice);
+
+  const keyboard: Keyboard = TOLERANCE_OPTIONS.map((o) => [
+    { text: (o.key === active ? '● ' : '○ ') + o.label, callback_data: 'sizes:' + o.key },
+  ]);
+  keyboard.push([{ text: BUTTON.back, callback_data: 'settings:' }]);
+
+  return { text, keyboard };
+}
+
 export function buildAboutCard(): Card {
   return {
     text:
@@ -389,7 +435,7 @@ export function buildAboutCard(): Card {
       'Я читаю ваш кошик у «Сільпо» і для кожної позиції шукаю дешевший аналог: інша марка того самого товару, акція, купон або балабонуси.\n\n' +
       'Суть покупки не змінюється — обсяг, жирність і призначення лишаються ті самі. Молоко 2,5% замінюю тільки на молоко 2,5%.\n\n' +
       'Ви бачите кожну заміну окремо й обираєте, що застосувати. Без вашого підтвердження кошик не змінюється.\n\n' +
-      'Об’єм упаковки «Сільпо» у пошуку не показує, тому я перевіряю його вже в кошику і повертаю оригінал, якщо він відрізняється.',
+      'Обсяг упаковки звіряю одразу — і ще раз перевіряю в кошику перед тим, як лишити заміну. Якщо він відрізняється, повертаю оригінал.',
     keyboard: [[{ text: BUTTON.back, callback_data: 'settings:' }]],
   };
 }
@@ -595,9 +641,13 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   // Each caveat is its own paragraph. Run together they read as one long
   // disclaimer and get skipped as a block.
   const notes: string[] = [];
-  // Pack size is invisible in search and readable only from the cart, so the
-  // rollback has to be announced before it happens or it looks like a fault.
-  notes.push('📦 <i>Об’єм упаковки «Сільпо» у пошуку не показує. Перевірю його при заміні й поверну оригінал, якщо він суттєво відрізняється.</i>');
+  // There used to be an unconditional note here explaining that Silpo does not
+  // expose pack size in search, so it could only be checked from the cart. That
+  // stopped being true in silpo-mcp-service v1.108.0: `displayRatio` is present
+  // on every candidate (measured 361 of 361), so pack size is compared before a
+  // replacement is ever proposed. A caveat that no longer applies is worse than
+  // none — the rare line that genuinely could not be compared says so on its own
+  // row instead.
   if (plan.slotExpired) {
     notes.push('⏰ <i>Слот доставки протух — наявність може відрізнятися.</i>');
   }
@@ -655,7 +705,9 @@ export function buildDetailsCard(plan: Plan, planId: string): Card {
     ];
     if (r.brand) lines.push('      🏷 марка ' + esc(r.brand));
     if (r.aiReason) lines.push('      💬 <i>' + esc(r.aiReason) + '</i>');
-    if (r.verifySize) lines.push('      📦 <i>об’єм упаковки перевірю в кошику</i>');
+    // Rare now: fires when the two pack sizes are not comparable at all — a
+    // count against a volume ("30шт" vs "1,5л") — not because the data is missing.
+    if (r.verifySize) lines.push('      📦 <i>фасування не звірити — перевірю в кошику</i>');
     return lines.join('\n');
   });
 
@@ -697,7 +749,150 @@ interface ApplyResult {
   vanished?: number;
   deselected?: number;
   loyalty?: { bonusAvailable?: number };
-  validations?: Array<{ level: string; message: string }>;
+  validations?: Array<{ level: string; message: string; productName?: string | null }>;
+}
+
+/**
+ * Silpo's cart validations, turned into something a guest can act on.
+ *
+ * `message` is an i18n key, not a sentence — a live cart returned
+ * `product.offer.stock.max`, and the bot printed exactly that under
+ * "Кошик потребує уваги". The useful part sits in `context`, which names the
+ * product and its stock, and was being discarded.
+ *
+ * An unrecognised key never reaches the guest: it degrades to one plain line.
+ * Warnings are shown only when they are known and actionable, so an unmapped
+ * warning stays out of the way instead of adding noise.
+ */
+export function validationLines(
+  validations: Array<{ level: string; message: string; productName?: string | null }>,
+): string[] {
+  const lines: string[] = [];
+  let unknownErrors = 0;
+
+  for (const v of validations) {
+    const key = String(v.message || '');
+    const name = v.productName ? ' — ' + v.productName : '';
+
+    if (key.indexOf('product.offer.stock') === 0) {
+      lines.push('Товар закінчився' + name + '. Приберіть або замініть його, щоб оформити замовлення.');
+    } else if (key === 'order.adult.is_not_confirmed') {
+      lines.push('У кошику є алкоголь — підтвердьте повноліття у застосунку «Сільпо».');
+    } else if (key.indexOf('timeslot') !== -1) {
+      lines.push('Час доставки минув — оберіть новий у застосунку «Сільпо».');
+    } else if (key.indexOf('order.min') === 0) {
+      lines.push('Сума замовлення менша за мінімальну для доставки.');
+    } else if (v.level === 'error') {
+      unknownErrors++;
+    }
+  }
+
+  if (unknownErrors) {
+    lines.push(
+      unknownErrors === 1
+        ? 'Одна позиція потребує уваги — перевірте кошик у застосунку «Сільпо».'
+        : unknownErrors + ' позиції потребують уваги — перевірте кошик у застосунку «Сільпо».',
+    );
+  }
+  return lines;
+}
+
+/**
+ * A wish printed under the result, the way Silpo prints one at the bottom of a
+ * till receipt.
+ *
+ * Written for this project in that spirit — the real receipt texts are Silpo's
+ * own, produced by their in-house authors, and are not reproduced here.
+ *
+ * These lived in a template literal in `build.ts` until 2026-08-17, which broke
+ * working rule 12: guest-facing copy there is escaped twice, and the array only
+ * survived because every apostrophe in it happened to be the typographic `’`.
+ * One ordinary `'` in a new line would have ended the JS string mid-array.
+ */
+export const WISHES = [
+  'Нехай попереду буде тиждень, у якому все складається легше, ніж здавалося.',
+  'Найсмачніше в цьому кошику — те, що ви приготуєте самі.',
+  'Дрібні заощадження мають звичку перетворюватися на великі радощі.',
+  'Завтра трапиться щось приємне. Дрібниця, але точно вчасно.',
+  'Хтось сьогодні згадає вас добрим словом. Можливо, за вечерю.',
+  'Хороший день починається просто: смачно поїсти й нікуди не поспішати.',
+  'Нехай удома на вас чекає тиша або сміх — залежно від того, чого більше хочеться.',
+  'Іноді найкращий план на вечір — це добре повечеряти.',
+  'Ви щойно виграли трохи часу для себе. Витратьте його без користі.',
+  'Те, що ви шукали, знайдеться. Найімовірніше, на нижній полиці.',
+  'У цьому тижні буде день, який захочеться запам’ятати. Не пропустіть його.',
+  'Смак дому не залежить від ціни. Але приємно, коли він ще й вигідний.',
+];
+
+/**
+ * The guaranteed wish.
+ *
+ * Three branches react to a fact rather than to taste, so they stay in code:
+ * code decides them for free and more reliably than a model would. Everything
+ * else is drawn at random, and this is also the floor a failed model call falls
+ * back to — see `wishPrompt`.
+ */
+export function pickWish(saving: number, applied: number): string {
+  if (applied === 0) return 'Ваш кошик уже такий, як треба. Як і цей день.';
+  if (saving >= 150) return 'Такою економією можна пишатися. Або мовчки купити собі каву.';
+  if (saving > 0 && saving < 10) return 'Навіть маленька економія — це привід зробити собі щось приємне.';
+  return WISHES[Math.floor(Math.random() * WISHES.length)];
+}
+
+/**
+ * The prompt that writes a wish, kept here with the copy it produces.
+ *
+ * Working rule 12 puts the model prompt for guest-facing text in this file, not
+ * in the engine: it is Ukrainian copy that a reader has to judge by tone, and it
+ * belongs next to the static lines it replaces.
+ *
+ * The digit ban is the load-bearing rule. Without it the model reaches for the
+ * saving it was told about, and an unverified number lands in a guest message
+ * through a channel nothing else checks.
+ */
+export const WISH_SYSTEM_PROMPT = `Ти пишеш одне побажання під чеком супермаркету «Сільпо» — у дусі тих, що друкують на паперових чеках.
+
+ПРАВИЛА:
+- Рівно одне речення, до 90 символів.
+- Тепло й просто, без пафосу і без звертання на «ти».
+- ЖОДНИХ цифр, сум, відсотків і слів про знижку чи економію.
+- Без емодзі.
+- Можеш спертися на те, що людина купила, якщо з цього виходить гарний образ.
+  Не перелічуй товари і не називай бренди.
+
+МОВА — це найважливіше. Літературна українська, без русизмів і без калік.
+Перевір кожне слово: «прохолода», а не «прохлада»; «святом», а не «святком».
+Якщо сумніваєшся в слові — візьми простіше, у якому впевнений. Одне неправильне
+слово гірше, ніж нудне побажання.
+
+Відповідай виключно JSON: {"wish":"..."}`;
+
+export function buildWishPrompt(itemNames: string[], applied: number): string {
+  return [
+    'Людина щойно оновила свій кошик. Ось що в ньому:',
+    ...itemNames.slice(0, 20).map((n) => n.slice(0, 60)),
+    '',
+    `Замін застосовано: ${applied}`,
+  ].join('\n');
+}
+
+/**
+ * Accepts a model-written wish, or rejects it so the caller falls back.
+ *
+ * Deliberately strict: a wish is decoration, so anything questionable is thrown
+ * away rather than repaired. A digit is an outright reject — that is the check
+ * standing between a hallucinated figure and a guest.
+ */
+export function validateWish(text: unknown): string | null {
+  if (typeof text !== 'string') return null;
+  const wish = text.trim();
+  if (wish.length < 10 || wish.length > 120) return null;
+  if (/\d/.test(wish)) return null;
+  // One emoji would put two on the line, which rule 11 rules out — the section
+  // heading already carries 🧾.
+  if (/[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}]/u.test(wish)) return null;
+  if (wish.includes('<') || wish.includes('>')) return null;
+  return wish;
 }
 
 /**
@@ -748,7 +943,10 @@ export function buildResultText(result: ApplyResult, wish: string): string {
         esc(item.newRatio) + ' — не підійшло' + (item.tried && item.tried > 1 ? ', перебрав ' + item.tried + ' варіанти' : '') +
         '\n  залишив оригінал')
       .join('\n');
-    text += '\n\n<i>«Сільпо» не показує об’єм упаковки в пошуку — я бачу його лише тоді, коли товар уже в кошику. Менша упаковка за меншу ціну це не економія: двох таких коштуватимуть дорожче за оригінал.</i>';
+    // Reworded once search started exposing pack size: the check is no longer
+    // "the only place I can see it", it is the second, authoritative look. What
+    // the guest needs to understand is unchanged — a smaller pack is not a saving.
+    text += '\n\n<i>Фасування в кошику виявилося не тим, що показував пошук. Менша упаковка за меншу ціну це не економія: дві такі коштуватимуть дорожче за оригінал.</i>';
   }
 
   if (result.failed && result.failed.length) {
@@ -767,9 +965,9 @@ export function buildResultText(result: ApplyResult, wish: string): string {
     text += '\n\n💳 Балабонуси · ' + money(bonus) + ' — застосуйте при оформленні.';
   }
 
-  const errors = (result.validations || []).filter((v) => v.level === 'error');
-  if (errors.length) {
-    text += '\n\n⚠️ <i>Кошик потребує уваги: ' + esc(errors.map((e) => e.message).join(', ')) + '.</i>';
+  const issues = validationLines(result.validations || []);
+  if (issues.length) {
+    text += '\n\n⚠️ <b>Кошик потребує уваги</b>\n' + issues.map((line) => esc(line)).join('\n');
   }
 
   // The receipt wish closes the message the way a till slip closes a purchase.

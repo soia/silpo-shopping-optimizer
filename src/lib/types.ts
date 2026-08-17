@@ -3,7 +3,7 @@
  * and `docs/mcp-reference.md`) — not from the written documentation.
  */
 
-/** A line in the cart. This is the only place the API exposes `ratio` (pack size). */
+/** A line in the cart. Cart lines expose pack size as `ratio`. */
 export interface CartItem {
   productId: string;
   companyId: string;
@@ -23,9 +23,18 @@ export interface CartItem {
   addToBasketStep: number;
   comment?: string | null;
   available?: boolean;
+  /** Search tools report pack size under this name; carried for shape reuse. */
+  displayRatio?: string | null;
 }
 
-/** A product as returned by search tools. Note: no `ratio`, no brand, no category. */
+/**
+ * A product as returned by search tools.
+ *
+ * Since silpo-mcp-service v1.108.0 these carry `displayRatio` — the pack size,
+ * verified present on 19 of 19 candidates from `similar_products`. Before that
+ * pack size was unavailable for candidates, which was the engine's main
+ * quality ceiling.
+ */
 export interface ProductCandidate {
   id: string;
   name: string;
@@ -40,8 +49,24 @@ export interface ProductCandidate {
   companyId: string;
   branchId: string;
   externalProductId?: number;
+  /** Pack size on search results, e.g. "180г", "1,5л". */
+  displayRatio?: string | null;
   /** Present on cart lines only; kept optional so cart items reuse this shape. */
   ratio?: string | null;
+  /** From `attributes["Торгова марка"]`, filled in when details are fetched. */
+  brand?: string | null;
+  /** Runners-up, used when the cart reveals the first choice is wrong. */
+  alternates?: Alternate[];
+}
+
+export interface Alternate {
+  productId: string;
+  companyId: string;
+  branchId: string;
+  name: string;
+  price: number;
+  saving: number;
+  brand: string | null;
 }
 
 export interface LoyaltyInfo {
@@ -49,49 +74,6 @@ export interface LoyaltyInfo {
   bonusTotal?: number;
   bonusRequested?: number | null;
   isEnabled?: boolean;
-}
-
-export interface CandidateScores {
-  similarityScore: number;
-  priceSavingScore: number;
-  brandMatchScore: number;
-  sizeMatchScore: number;
-  promotionScore: number;
-  availabilityScore: number;
-}
-
-export interface ScoredCandidate {
-  productId: string;
-  companyId: string;
-  branchId: string;
-  slug: string;
-  name: string;
-  price: number;
-  oldPrice: number | null;
-  ratio: string | null;
-  stock: number;
-  available: boolean;
-  saving: number;
-  savingPct: number;
-  unitSavingPct: number | null;
-  sizeRatio: number | null;
-  sameUnitFamily: boolean;
-  /** True when neither side exposes a comparable pack size. */
-  sizeUnknown: boolean;
-  /** Large price drop with unknown pack size — likely a smaller package. */
-  suspiciousDrop: boolean;
-  /** Fat or content percentage parsed from each name, when present. */
-  originalPercent: number | null;
-  candidatePercent: number | null;
-  /** True when the grades differ beyond PERCENT_TOLERANCE. */
-  percentMismatch: boolean;
-  onPromotion: boolean;
-  /** From `attributes["Торгова марка"]`, filled in when details are fetched. */
-  brand?: string | null;
-  /** Runners-up, used when the cart reveals the first choice is wrong. */
-  alternates?: Array<{ productId: string; companyId: string; branchId: string; name: string; price: number; saving: number; brand: string | null }>;
-  scores: CandidateScores;
-  finalScore: number;
 }
 
 export interface Replacement {
@@ -108,11 +90,10 @@ export interface Replacement {
   replacementRatio: string | null;
   onPromotion: boolean;
   brand?: string | null;
-  alternates?: Array<{ productId: string; companyId: string; branchId: string; name: string; price: number; saving: number; brand: string | null }>;
+  alternates?: Alternate[];
+  /** Computed by the model, not by code. */
   saving: number;
   savingPct: number;
-  finalScore: number;
-  scores: CandidateScores;
   /** Surfaces a "check the pack size" warning in the Telegram card. */
   verifySize: boolean;
   aiReason?: string | null;
@@ -141,12 +122,4 @@ export interface OptimizationPlan {
 export interface ParsedSize {
   value: number;
   unit: "g" | "ml";
-}
-
-export interface AIDecision {
-  index: number;
-  accept: boolean;
-  confidence: number;
-  reason: string;
-  source: "ai" | "fallback";
 }

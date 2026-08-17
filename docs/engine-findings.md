@@ -1,5 +1,11 @@
 # Engine results and known limits
 
+> **Superseded on 2026-08-17.** Everything below measures the deterministic
+> scorer in `src/lib/optimizer.ts`, which has been removed. The model now makes
+> every decision and computes every figure (`src/lib/ai-ranker.ts`). The section
+> at the end records the current measurements; the rest is kept because its
+> failure analysis is what the new engine was built against.
+
 Measured with `npm run optimize` against a live cart of 14 items at a Kyiv
 store, on 2026-08-12.
 
@@ -137,6 +143,10 @@ is reported explicitly: *"Alpro Original — 1л → 0,25л, залишив ор
 
 If Silpo ever exposes `displayRatio` in search results, `sizeOf()` picks it up
 and the check moves earlier with no other change.
+
+> It did, in v1.108.0 — and this prediction was wrong on the mechanism:
+> `sizeOf()` reads `ratio`, which candidates do not have, so the field has to be
+> read by name. See the 2026-08-17 section.
 
 ### A parser bug that hid all of this
 
@@ -308,3 +318,188 @@ npm run test:node           # runs the generated Code node against live MCP
 
 `npm run optimize` never calls a write tool. Cart changes only happen through
 the bot, after an explicit confirmation.
+
+---
+
+## 2026-08-17 — the all-model engine
+
+`src/lib/optimizer.ts` was deleted. The model chooses each replacement and
+computes `saving`, `savingPct` and the plan totals; there is no rule-based
+fallback. Measured on a live 14-item cart totalling 1338.54 UAH.
+
+| Engine | Saving | Replacements | Reproducible |
+|---|---|---|---|
+| Deterministic scorer + AI accept/reject | 100.50 UAH (7.51%) | 6 | yes |
+| — of which defensible | 40.50 UAH | 2 | — |
+| Keyword fallback only | 40.50 UAH (3.03%) | 2 | yes |
+| All-model, run 1 | 40.00 UAH (2.99%) | 3 | **no** |
+| All-model, run 2 | 37.50 UAH (2.80%) | 3 | **no** |
+
+**The headline is 37.50–40.00 UAH.** Two things about that number:
+
+- The old 100.50 was inflated. Four of its six replacements were «Моршинська»
+  drinks flagged `verifySize` — same product name, 44% cheaper, which Silpo's
+  own data now confirms means a smaller pack. Removing them leaves 40.50, so
+  the hybrid engine never actually beat its own keyword fallback on this cart.
+- The all-model engine rejects those four outright, because
+  `displayRatio` (silpo-mcp-service v1.108.0) exposes candidate pack size for
+  the first time. That is the quality ceiling lifting, not a regression.
+
+### What got worse
+
+**Reproducibility.** 40.00 and 37.50 on identical input. The deterministic
+scorer returned the same figure every time; the model picks a different
+candidate between runs. Any demo metric must be quoted as a range.
+
+**Effort sensitivity.** At `effort: low` the model chose the most *similar*
+candidate rather than the cheapest acceptable one and the saving collapsed to
+**1.00 UAH** — it also selected three candidates that cost more than the
+original. Both were fixed by saying "among acceptable options choose the
+cheapest" in the prompt and raising effort to `medium`. Choosing from 30
+candidates is not the cheap judgement it looked like.
+
+**Cost and latency.** One model call per cart line plus one for totals: 15 calls
+and ~33–49 s per analysis, against 1 call before.
+
+### Arithmetic
+
+Verified digit-for-digit on two runs — all savings, percentages and totals
+matched a deterministic recomputation, including a weighted line (199.00 →
+189.00 at 0.1 kg = 1.00, not 10.00). It is **not** guaranteed: the discarded
+`effort: low` run produced a negative saving and reported a real price increase
+as 0.00.
+
+### Not verified
+
+The n8n workflow builds, validates and every Code node compiles, but the
+deployed bot has **not** been run end to end against Telegram since the change.
+The apply path in particular — 14 per-line model calls inside one Code node,
+under n8n's own execution timeout — has never executed.
+
+### Token cost, measured
+
+One live 14-item run, `effort: medium`, prices at Sonnet 5 introductory rates
+(\$2 / \$10 per MTok, through 2026-08-31):
+
+```
+prompt tokens        40 331   full price 18 995 · cache write 4 572 · cache read 16 764
+output tokens         4 431
+cost                 $0.097 per analysis   →  ~51 runs per $5
+```
+
+**Caching the selection system prompt saves 22%.** It is re-sent once per cart
+line, byte-identical, and measures 1161 tokens — just over Sonnet 5's
+1024-token minimum. 14 of the 15 calls read it from cache. A prompt edit that
+trims ~140 tokens would drop it below the minimum and it would silently stop
+caching, so `npm run optimize` prints `cache read` on every run.
+
+Two things that were expected and turned out wrong:
+
+- **A prediction of +47% more runs per \$5 was overstated; the real figure is
+  +22%.** It came from measuring output on one easy call (80 tokens) and
+  extrapolating. Across a full run output averages ~295 tokens per call, so
+  output is 46% of the cost — and caching cannot touch output.
+- **Raising `effort` from `low` to `medium` is free.** Measured on the same
+  input: `in=3043 out=80` at `low`, `in=3043 out=82` at `medium`. The change
+  that lifted the saving from 1.00 to 37.50 UAH cost nothing.
+
+Cache warming (serialising the first call so the concurrent three do not all
+pay the write premium) was considered and rejected: ~4 calls pay it, worth
+about \$0.002 per run, against added latency and a special case in both hosts.
+
+The receipt wish, if it is ever generated by a model instead of drawn from the
+static list, measures 516 input tokens on Haiku 4.5 — **0.77% of a run**. Cost
+is not an argument either way for that feature.
+
+### The receipt wish
+
+Moved out of a `build.ts` template literal into `src/lib/ui.ts` (working rule
+12), then given a model. The static list stays as the guaranteed floor.
+
+**This is the one place a model failure is answered with a silent fallback**,
+and the reason is the inverse of why the engine's fallback was removed. A wish
+carries no number and no claim, and it is written *after* the cart has already
+been changed — the message has to reach the guest so they learn what happened.
+A static line is less personal, not wrong. The engine's fallback made
+unverifiable claims about money that looked identical to real ones.
+
+Everything the model returns goes through `validateWish` first: a digit is an
+outright reject (that check is what stands between a hallucinated figure and a
+guest), plus limits on length, emoji and angle brackets. Verified against six
+crafted inputs — digit, over-length, emoji, HTML, empty, clean — all classified
+correctly.
+
+**Model choice was got wrong first time.** Haiku 4.5 was picked on cost
+reasoning, since a one-line wish looked easy. Over 8 generations roughly half
+carried Ukrainian errors:
+
+```
+«Нехай у дома завжди буде місце…»              (у домі / удома)
+«…прохолодний напиток…»                        (напій)
+«Нехай ваш стіл буває щедрим…»                 (буде)
+«…прохолодна піна при кожному ґлоткові»        (ковтку)
+```
+
+An explicit instruction to use literary Ukrainian and avoid russianisms fixed
+«святком» and «прохлада» but not these. Sonnet 5 produced 8 clean lines out of
+8, at \$0.002 per wish — about 2% of a run.
+
+The lesson is not "use the bigger model". Cost was never the binding constraint
+here (0.77% on Haiku, ~2% on Sonnet), so optimising for it was optimising the
+wrong axis. The binding constraint was language quality in copy a Ukrainian
+retailer's guest reads.
+
+Cart item names for the prompt ride out of `Apply Changes`, which has already
+read the cart back — the wish costs no extra MCP call.
+
+### Arithmetic moved back into code
+
+Measured on a live 22-item cart (4286.86 UAH, nine weighted lines), the model
+computing its own savings got **2 of 16 wrong**:
+
+```
+qty 0.3   839.00 → 399.00    model 1.32      correct 132.00
+qty 0.25  659.00 → 169.00    model 129.54    correct 122.50
+
+model plan total   1082.97
+computed total     1206.61     short by 123.64 UAH
+```
+
+Both failures were weighted lines. The earlier 14-item cart had one weighted
+line and was exact on two consecutive runs, which is why this stayed hidden —
+the defect needed a basket with meat and cheese counters in it.
+
+`computeSaving()` and `buildPlan()` now produce every figure from MCP prices.
+The model still chooses the candidate, judges the purchase intent and the pack
+size, and reads prices to pick the cheapest acceptable option; it returns
+indices and words only. Re-measured on the same cart: **17 of 17 lines, every
+percentage and every total exact.**
+
+Two side effects, both good: the totals model call is gone (one fewer round trip
+per run) and the response schema is smaller.
+
+### Pack-size tolerance as a guest setting
+
+Three presets in Settings — `strict` 0.95-1.05, `normal` 0.8-1.25, `loose`
+0.6-1.7 — stored per guest in `silpo_sessions.size_tolerance`, enforced in the
+prompt at selection and again at apply time against the cart's own `ratio`. Apply
+reads the band **from the plan**, so changing the setting while a card is on
+screen cannot re-judge a plan the guest already approved.
+
+Measured on one cart, same basket, three runs:
+
+| Preset | Saving | Replacements |
+|---|---|---|
+| strict | 818.90 UAH (19.1%) | 13 |
+| normal | 1146.65 UAH (26.8%) | 18 |
+| loose | 1524.07 UAH (35.6%) | 18 |
+
+`loose` is only defensible because of a rule added with it: when the candidate's
+pack is smaller, the price for the same quantity must actually be better. That
+rule was impossible before `displayRatio` existed — there was no candidate pack
+size to divide by.
+
+Band verification on a 17-replacement plan at `normal`: 17 of 17 pairs
+comparable, all within 0.80-1.20, none out of band, `verifySize` flagged zero
+times. Presets rather than a typed number: a free-form value needs parsing,
+validation and an error path, and "0.8" means nothing to a shopper.

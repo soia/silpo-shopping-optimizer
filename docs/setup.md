@@ -8,7 +8,7 @@ Ten steps from an empty n8n instance to a working bot.
 [x] Create the three n8n data tables
 [ ] Generate TOKEN_ENCRYPTION_KEY and set it in n8n
 [ ] Create the Telegram credential in n8n
-[ ] (optional) Add an Anthropic key and re-enable the semantic check
+[ ] Set ANTHROPIC_API_KEY as an n8n Variable (required — the model is the engine)
 [ ] Import both workflows (two separate workflows, not one canvas)
 [ ] Publish both workflows
 [ ] Run the test scenario
@@ -60,15 +60,20 @@ it. **Overview → Data tables**, three tables:
 | Table | Columns |
 |---|---|
 | `silpo_oauth_state` | `state` (string), `telegram_user_id` (number), `chat_id` (number), `code_verifier` (string), `client_id` (string) |
-| `silpo_sessions` | `telegram_user_id` (number), `client_id` (string), `access_token_enc` (string), `refresh_token_enc` (string), `expires_at` (string), `blocked_brands` (string) |
+| `silpo_sessions` | `telegram_user_id` (number), `client_id` (string), `access_token_enc` (string), `refresh_token_enc` (string), `expires_at` (string), `blocked_brands` (string), `size_tolerance` (string) |
 | `optimization_plans` | `plan_id` (string), `telegram_user_id` (number), `cart_id` (string), `plan_json` (string), `original_total` (number), `status` (string) |
 
 n8n adds `id`, `createdAt` and `updatedAt` to every table automatically; the
 TTL checks use `createdAt`.
 
-> **If the tables already exist**, add the `blocked_brands` column (string) to
-> `silpo_sessions` — it holds the brand blocklist, pipe-separated. Without it
-> `/block` fails on write.
+> **If the tables already exist**, add two columns (both string) to
+> `silpo_sessions`:
+>
+> - `blocked_brands` — the brand blocklist, pipe-separated. Without it `/block`
+>   fails on write.
+> - `size_tolerance` — `strict` / `normal` / `loose`, the pack-size band the
+>   guest picked in Settings. Absent or unrecognised reads as `normal`, so the
+>   bot keeps working without it; only the setting silently stops persisting.
 
 > Table ids and the instance URL are compiled into the workflows. Put yours in
 > **`.secrets/n8n.json`** (gitignored) and rebuild:
@@ -103,28 +108,34 @@ re-authorize.
 
 ---
 
-## 5. Anthropic API key — currently skipped
+## 5. Anthropic API key — required
 
-The workflow is built **without** the model call: `AI_SEMANTIC_CHECK = false` in
-`src/workflow/build.ts`. A node with no credential fails outright in n8n rather
-than routing through `onError`, so it is left out entirely instead of shipping a
-guaranteed error.
-
-The rule-based fallback takes its place and rejects replacements that break the
-purchase intent — protein products, lactose-free, no-added-sugar, baby food,
-fermented drinks. Verified on the real cart: it accepts the Snickers swap and
-rejects the protein dessert and the kombucha.
-
-To enable the model later:
+The model is the engine: it picks every replacement and computes every figure.
+There is no rule-based fallback any more, so without a key the bot has nothing
+to propose and the run fails with a plain message.
 
 1. [console.anthropic.com](https://console.anthropic.com) → API Keys → Create Key
-   (\$5 of credit is plenty for a demo).
-2. n8n → Credentials → Anthropic API, named `Anthropic API`.
-3. Set `AI_SEMANTIC_CHECK = true` and run `npm run build:workflows`.
-4. Re-import `telegram-bot.json`.
+   (\$5 of credit is plenty for a demo — top the balance up, or every request
+   returns `400 credit balance is too low`).
+2. n8n → Settings → **Variables** → New variable, name `ANTHROPIC_API_KEY`,
+   scope Global.
 
-Expected effect: savings rise from about 96 UAH to roughly 200–280, because the
-model recognises cases the keyword rules reject too bluntly.
+**A Variable, not a Credential.** The call lives inside the `Optimize Cart` Code
+node, which already has an HTTP transport and makes one request per cart line —
+something an HTTP Request node cannot do. Code nodes cannot read credentials, so
+the key travels the same channel as `TELEGRAM_BOT_TOKEN`. There is no
+`AI_SEMANTIC_CHECK` flag left to flip and no `Anthropic API` credential to
+create.
+
+Cost per analysis: one model call per cart line plus one for the totals — 15
+calls on a 14-item cart, at `effort: medium`. Measured on a live 14-item cart:
+**~$0.097 per analysis, roughly 51 runs per \$5** of credit.
+
+The selection system prompt is cached (`cache_control: ephemeral`), which cuts
+~22% off that. It is 1161 tokens against Sonnet 5's 1024-token minimum, so
+shortening that prompt by ~140 tokens would silently stop it caching — the API
+reports no error, only `cache_read_input_tokens: 0`. `npm run optimize` prints
+that counter on every run for exactly this reason.
 
 ---
 
@@ -136,6 +147,7 @@ model recognises cases the keyword rules reject too bluntly.
 |---|---|---|---|
 | `TOKEN_ENCRYPTION_KEY` | **Global** | yes | 64 hex characters from step 4 |
 | `TELEGRAM_BOT_TOKEN` | **Global** | yes | the bot token from step 1 |
+| `ANTHROPIC_API_KEY` | **Global** | yes | the key from step 5 — the engine cannot run without it |
 | `N8N_BASE_URL` | Global | no | Overrides the URL compiled into the workflows |
 
 `TELEGRAM_BOT_TOKEN` duplicates what the Telegram credential already holds. It is
@@ -184,8 +196,8 @@ n8n → Credentials → + Add credential. The names must match the workflow JSON
 |---|---|---|
 | Telegram API | `Silpo Bot` | token from step 1 |
 
-One credential is all the current build needs. Storage is n8n's own data tables,
-and the Anthropic node is not in the workflow yet (step 5).
+One credential is all the build needs. Storage is n8n's own data tables, and the
+Anthropic key is a Variable rather than a credential (step 5).
 
 **Create it before importing, and put its id in `.secrets/n8n.json`.** n8n binds
 a node's credential by id first and falls back to the name only afterwards, so a
@@ -202,7 +214,7 @@ n8n → Workflows → Import from File:
 
 Import the personalised build, not the tracked one:
 
-1. `.secrets/workflows/telegram-bot.json` — 44 nodes
+1. `.secrets/workflows/telegram-bot.json` — 61 nodes
 2. `.secrets/workflows/oauth-callback.template.json` — 9 nodes
 
 The files under [`workflows/`](../workflows/) are the same workflows built with
@@ -287,8 +299,12 @@ Saving:      96,81 UAH (9.3%)
 Loyalty bonuses: 34.24 (potential)
 ```
 
-Those are fallback numbers, without an Anthropic key. With the key, expect
-roughly 200–280 UAH. Details in [engine-findings.md](engine-findings.md).
+Those figures came from the deterministic engine that has since been removed.
+The current all-model engine measured **37.50 and 40.00 UAH on two runs of the
+same cart** — lower, and no longer reproducible run to run, because the model
+chooses the candidate. The drop is mostly honest: `displayRatio` now exposes
+pack size, so the smaller-pack "bargains" that inflated the old number are
+rejected. Details in [engine-findings.md](engine-findings.md).
 
 ---
 

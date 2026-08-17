@@ -1,8 +1,8 @@
 {
-  "fetchedAt": "2026-08-11T21:21:31.158Z",
+  "fetchedAt": "2026-08-17T13:29:42.004Z",
   "serverInfo": {
     "name": "silpo-mcp-service",
-    "version": "1.107.2"
+    "version": "1.108.0"
   },
   "protocolVersion": "2025-06-18",
   "capabilities": {
@@ -350,7 +350,7 @@
     {
       "name": "silpo_find_products_batch",
       "title": "Find Products Batch",
-      "description": "Search for multiple products at once (semicolon-separated, max 30). Prefer getting branchId/deliveryType/timeslot from silpo_get_shopping_cart_by_id (existing cart).\n\nSEARCH BY ARTICLE CODE: The `products` search terms accept exact numeric article codes (externalProductId) in addition to free-text names — e.g. searching \"795319\" returns the exact product with that externalProductId. This is the most reliable match: prefer numeric externalProductId over fuzzy name matching whenever it is already known (e.g. from a silpo_get_my_offline_orders receipt line's lagerId, a silpo_get_my_online_orders result, or a cart/favorites entry) — it eliminates ambiguity from product names.\n\nBUDGET: If user mentions a budget, ALWAYS fill the cart as close to the budget limit as possible. Maximize the total spend without exceeding it — add more items or increase quantities to use the full budget.",
+      "description": "Search for multiple products at once (semicolon-separated, max 30). Prefer getting branchId/deliveryType/timeslot from silpo_get_shopping_cart_by_id (existing cart).\n\nSEARCH BY ARTICLE CODE: The `products` search terms accept exact numeric article codes (externalProductId) in addition to free-text names — e.g. searching \"795319\" returns the exact product with that externalProductId. This is the most reliable match: prefer numeric externalProductId over fuzzy name matching whenever it is already known (e.g. from a silpo_get_my_offline_orders receipt line's lagerId, a silpo_get_my_online_orders result, or a cart/favorites entry) — it eliminates ambiguity from product names.\n\nPACKAGE SIZE: displayRatio shows the actual content of one unit (e.g. \"400г\", \"10 шт\") — use it together with step to compute how many units to add for a requested weight/volume/count. step alone only tells you the minimum increment (e.g. step=1 unit), not what one unit contains.\n\nBUDGET: If user mentions a budget, ALWAYS fill the cart as close to the budget limit as possible. Maximize the total spend without exceeding it — add more items or increase quantities to use the full budget.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -489,6 +489,16 @@
                       "step": {
                         "type": "number"
                       },
+                      "displayRatio": {
+                        "anyOf": [
+                          {
+                            "type": "string"
+                          },
+                          {
+                            "type": "null"
+                          }
+                        ]
+                      },
                       "specialPrices": {
                         "anyOf": [
                           {
@@ -561,6 +571,7 @@
                       "image",
                       "weighted",
                       "step",
+                      "displayRatio",
                       "specialPrices",
                       "companyId",
                       "branchId",
@@ -607,7 +618,7 @@
     {
       "name": "silpo_get_products",
       "title": "Get Products",
-      "description": "Browse products at a Silpo branch with filters. At least one filter required: category, mustHavePromotion, promotionCode, or set. Prefer getting branchId/deliveryType/timeslot from silpo_get_shopping_cart_by_id (existing cart). NOTE: promotionCode automatically enables mustHavePromotion.",
+      "description": "Browse products at a Silpo branch with filters. At least one filter required: category, mustHavePromotion, promotionCode, or set. Prefer getting branchId/deliveryType/timeslot from silpo_get_shopping_cart_by_id (existing cart). NOTE: promotionCode automatically enables mustHavePromotion.\n\nPACKAGE SIZE: displayRatio shows the actual content of one unit (e.g. \"400г\", \"10 шт\") — use it together with step to compute quantities for a requested weight/volume/count.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -783,6 +794,16 @@
                 "step": {
                   "type": "number"
                 },
+                "displayRatio": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "specialPrices": {
                   "anyOf": [
                     {
@@ -855,6 +876,7 @@
                 "image",
                 "weighted",
                 "step",
+                "displayRatio",
                 "specialPrices",
                 "companyId",
                 "branchId",
@@ -2295,7 +2317,7 @@
     {
       "name": "silpo_get_product_details",
       "title": "Get Product Details",
-      "description": "Get detailed information about a specific product by branch and slug. Returns product attributes, nutrition info, and image URLs.\n\nCRITICAL: The slug parameter MUST come from the slug field in silpo_find_products_batch or silpo_get_products results. NEVER construct or guess a slug from a product name — slugs are generated by Silpo and cannot be derived from names. If you don't have a slug from a previous search, call silpo_find_products_batch first.",
+      "description": "Get detailed information about a specific product by branch and slug. Returns product attributes, nutrition info, and image URLs.\n\nCRITICAL: The slug parameter MUST come from the slug field in silpo_find_products_batch or silpo_get_products results. NEVER construct or guess a slug from a product name — slugs are generated by Silpo and cannot be derived from names. If you don't have a slug from a previous search, call silpo_find_products_batch first.\n\nPACKAGE SIZE: displayRatio shows the actual content of one unit (e.g. \"400г\", \"10 шт\") — use it together with step to compute how many units to add for a requested weight/volume/count. step alone only tells you the minimum increment, not what one unit contains.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -2392,6 +2414,16 @@
                   }
                 ]
               },
+              "displayRatio": {
+                "anyOf": [
+                  {
+                    "type": "string"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
               "url": {
                 "type": "string"
               },
@@ -2442,6 +2474,7 @@
               "weighted",
               "step",
               "ratio",
+              "displayRatio",
               "url",
               "images",
               "attributes",
@@ -2461,7 +2494,7 @@
     {
       "name": "silpo_get_similar_products",
       "title": "Get Similar Products",
-      "description": "Find products similar to a given product. Use to suggest alternatives.",
+      "description": "Find products similar to a given product. Use to suggest alternatives.\n\nPACKAGE SIZE: displayRatio shows the actual content of one unit (e.g. \"400г\", \"10 шт\") — use it together with step to compute quantities for a requested weight/volume/count.",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -2560,6 +2593,16 @@
                 "step": {
                   "type": "number"
                 },
+                "displayRatio": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "specialPrices": {
                   "anyOf": [
                     {
@@ -2632,6 +2675,7 @@
                 "image",
                 "weighted",
                 "step",
+                "displayRatio",
                 "specialPrices",
                 "companyId",
                 "branchId",
@@ -5186,7 +5230,7 @@
     {
       "name": "silpo_get_my_favorites",
       "title": "Get My Favorites",
-      "description": "Get the user's favorite products at a Silpo branch. Returns products in the same format as silpo_get_products — use companyId, branchId, id, and step to add items to cart via silpo_add_or_update_cart_products.\n\nAll inputs must be taken from silpo_get_shopping_cart_by_id: branchId, deliveryType, timeslotStart (slot.start).",
+      "description": "Get the user's favorite products at a Silpo branch. Returns products in the same format as silpo_get_products — use companyId, branchId, id, and step to add items to cart via silpo_add_or_update_cart_products.\n\nPACKAGE SIZE: displayRatio shows the actual content of one unit (e.g. \"400г\", \"10 шт\") — use it together with step to compute quantities for a requested weight/volume/count.\n\nAll inputs must be taken from silpo_get_shopping_cart_by_id: branchId, deliveryType, timeslotStart (slot.start).",
       "inputSchema": {
         "$schema": "http://json-schema.org/draft-07/schema#",
         "type": "object",
@@ -5306,6 +5350,16 @@
                 "step": {
                   "type": "number"
                 },
+                "displayRatio": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
                 "specialPrices": {
                   "anyOf": [
                     {
@@ -5378,6 +5432,7 @@
                 "image",
                 "weighted",
                 "step",
+                "displayRatio",
                 "specialPrices",
                 "companyId",
                 "branchId",

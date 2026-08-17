@@ -74,6 +74,7 @@ interface UiModule {
   buildSettingsCard: (authorized: boolean, blocked: number) => Card;
   buildAboutCard: () => Card;
   buildBrandsCard: (brands: string[], notice?: string) => Card;
+  buildSizesCard: (tolerance?: string | null, notice?: string) => Card;
   buildCartCard: (lines: unknown[], total: number, extras?: unknown) => Card;
   buildSelectionCard: (plan: unknown, selected: number[]) => Card;
   buildDetailsCard: (plan: unknown, planId: string) => Card;
@@ -98,7 +99,7 @@ function loadUi(): UiModule {
 
   const names: Array<keyof UiModule> = [
     'UI', 'BUTTON', 'COMMANDS', 'BRAND_PROMPT_MARKER',
-    'buildHomeCard', 'buildSettingsCard', 'buildAboutCard', 'buildBrandsCard',
+    'buildHomeCard', 'buildSettingsCard', 'buildAboutCard', 'buildBrandsCard', 'buildSizesCard',
     'buildCartCard', 'buildSelectionCard', 'buildDetailsCard', 'buildResultText',
     'buildErrorText', 'brandToast', 'logoutKeyboard', 'homeKeyboard',
     'screenRequests', 'brandPromptRequest',
@@ -197,6 +198,9 @@ const SCREENS: Array<[string, Card | string]> = [
   ['brands', ui.buildBrandsCard(['Премія', 'Ascania', 'Лавка традицій Lago'])],
   ['brands — empty', ui.buildBrandsCard([])],
   ['brands — after /block', ui.buildBrandsCard(['Премія', 'Ascania'], ui.brandToast('added', 'Ascania'))],
+  ['sizes', ui.buildSizesCard('normal')],
+  ['sizes — strict', ui.buildSizesCard('strict')],
+  ['sizes — after tap', ui.buildSizesCard('loose', 'Збережено: вільно')],
   ['brand prompt', ui.UI.brandPrompt],
   ...['auth', 'rate', 'upstream', 'cart', 'unknown'].map(
     (kind) => [`error — ${kind}`, ui.buildErrorText(kind)] as [string, string],
@@ -352,7 +356,7 @@ const ENTRY_POINTS: Array<[string, unknown]> = [
   ...['optimize', 'cart', 'settings'].map(
     (key) => [`keyboard: ${ui.BUTTON[key]}`, message(ui.BUTTON[key])] as [string, unknown],
   ),
-  ...['connect:', 'optimize:', 'cart:', 'settings:', 'about:', 'home:', 'brands:', 'bradd:', 'brx:2',
+  ...['connect:', 'optimize:', 'cart:', 'settings:', 'about:', 'home:', 'brands:', 'bradd:', 'brx:2', 'sizes:', 'sizes:loose',
     'apply:abc123', 'details:abc123', 'cancel:abc123', 't:abc123:4', 'logout:ask', 'logout:yes', 'logout:no',
   ].map((data) => [`button ${data}`, tap(data)] as [string, unknown]),
   ['reply to the brand prompt', message('Яготинське', { reply_to_message: { text: ui.BRAND_PROMPT_MARKER + '\n\nНаприклад: Яготинське' } })],

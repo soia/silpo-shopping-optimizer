@@ -13,15 +13,25 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callTool, mapLimit, stats } from '../lib/mcp.ts';
-import { scoreCandidate, filterCandidates, buildPlan, type ItemBest } from '../lib/optimizer.ts';
-import { rankWithAI, applyDecisions } from '../lib/ai-ranker.ts';
-import type { CartItem, ProductCandidate, ScoredCandidate } from '../lib/types.ts';
+import { selectReplacement, buildPlan, aiStats, AI_ERROR_PREFIX, type SelectedItem } from '../lib/ai-ranker.ts';
+import type { CartItem, ProductCandidate } from '../lib/types.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
 const CONCURRENCY = 3;
 const startedAt = Date.now();
 
+const API_KEY = process.env.ANTHROPIC_API_KEY;
+if (!API_KEY) {
+  console.error('\nANTHROPIC_API_KEY is not set. The engine is the model — there is no');
+  console.error('rule-based fallback any more. Put the key in .env (see .env.example).\n');
+  process.exit(1);
+}
+
 const money = (n: number) => `${Number(n).toFixed(2)} UAH`;
+
+// The bot reads this per guest from the session row; locally it is an env knob so
+// the three bands can be compared on the same cart.
+const TOLERANCE = process.env.SIZE_TOLERANCE ?? 'normal';
 
 /* 1. Cart */
 console.log('\nAnalyzing cart…\n');
@@ -111,30 +121,55 @@ if (unavailable.length) {
   }
 }
 
-/* 5. Deterministic scoring */
-const perItemBest: ItemBest[] = [];
-const diagnostics: Array<{ item: CartItem; considered: number; passed: number }> = [];
-const nearMisses: Array<{ item: CartItem; nearest: ScoredCandidate }> = [];
+/* 5. The model chooses. Every judgement and every number below is its own. */
+console.log('Choosing replacements');
+console.log(`  model: claude-sonnet-5 · size tolerance: ${TOLERANCE}`);
 
 /**
  * `silpo_get_similar_products` reports stale availability — observed
  * `available: true` / `stock: 1` for a product that `get_product_details` and
  * the cart both called unavailable. Details agrees with the cart, so the chosen
- * candidate is confirmed there before being proposed.
+ * candidate is confirmed there before being proposed. When the confirmation
+ * fails the model is asked again without that candidate, up to three rounds.
  */
-const CONFIRM_ATTEMPTS = 3;
+const diagnostics: Array<{ item: CartItem; considered: number; offered: number }> = [];
 let confirmationCalls = 0;
 let skippedUnavailable = 0;
 
-const confirmed = await mapLimit(items, CONCURRENCY, async (item, index) => {
-  const lookup = lookups[index];
-  const candidates = lookup.ok && lookup.value ? lookup.value : [];
-  const ranked = candidates
-    .map((raw) => ({ raw, scored: scoreCandidate(item, raw, item.quantity) }))
-    .filter((x) => filterCandidates(item, [x.scored], item.quantity).length > 0)
-    .sort((a, b) => b.scored.finalScore - a.scored.finalScore);
+// Two phases, matching the workflow: the model picks a ranked shortlist in one
+// call per line, then Silpo confirms the picks in order. Interleaving them and
+// re-asking the model per runner-up cost 3-4 calls a line and timed the n8n node
+// out at 60 s.
+const MODEL_CONCURRENCY = 6;
 
-  for (const candidate of ranked.slice(0, CONFIRM_ATTEMPTS)) {
+const pools = items.map((item, index) => {
+  const lookup = lookups[index];
+  const all = lookup.ok && lookup.value ? lookup.value : [];
+  // `similar_products` returns the original product itself as a candidate.
+  //
+  // Candidates priced at or above the original are dropped before the prompt is
+  // built. This is not a judgement the model should be making: a replacement
+  // must save money to be a replacement at all, so those rows cannot become an
+  // answer — they only make the prompt longer and the call slower.
+  return all.filter(
+    (c) => c.id !== item.productId && c.available && (c.stock ?? 0) >= item.quantity && c.price < item.price,
+  );
+});
+
+const picks = await mapLimit(items, MODEL_CONCURRENCY, async (item, index) =>
+  pools[index].length ? await selectReplacement(item, pools[index], API_KEY, TOLERANCE) : null,
+);
+const modelCalls = pools.filter((p) => p.length).length;
+
+const chosen = await mapLimit(items, CONCURRENCY, async (item, index) => {
+  const considered = pools[index].length;
+  const selection = picks[index].ok ? picks[index].value : null;
+  if (!selection || selection.chosen == null) return { considered, selection: null, candidate: null };
+
+  const order = [selection.chosen, ...selection.alternates];
+  for (const idx of order) {
+    const candidate = pools[index][idx];
+    if (!candidate) continue;
     confirmationCalls++;
     let details: any;
     try {
@@ -143,54 +178,52 @@ const confirmed = await mapLimit(items, CONCURRENCY, async (item, index) => {
         deliveryType,
         timeslotStart,
         timeslotEnd,
-        slug: candidate.raw.slug,
+        slug: candidate.slug,
       });
     } catch {
       continue;
     }
+
     const product = details.product ?? {};
     if (product.available === false || (product.stock ?? 0) < item.quantity) {
       skippedUnavailable++;
       continue;
     }
 
-    const confirmedRaw: ProductCandidate = {
-      ...candidate.raw,
-      price: product.price ?? candidate.raw.price,
-      oldPrice: product.oldPrice ?? candidate.raw.oldPrice,
-      stock: product.stock,
-      available: true,
+    return {
+      considered,
+      selection,
+      candidate: {
+        ...candidate,
+        price: product.price ?? candidate.price,
+        oldPrice: product.oldPrice ?? candidate.oldPrice,
+        stock: product.stock,
+        available: true,
+        brand: details.product?.attributes?.['Торгова марка'] ?? null,
+      } as ProductCandidate,
     };
-    const rescored = scoreCandidate(item, confirmedRaw, item.quantity);
-    if (!filterCandidates(item, [rescored], item.quantity).length) continue;
-    return { best: rescored, considered: candidates.length, passed: ranked.length };
   }
-  return { best: null, considered: candidates.length, passed: ranked.length };
+  return { considered, selection: null, candidate: null };
 });
 
-items.forEach((item, index) => {
-  const result = confirmed[index].ok ? confirmed[index].value! : { best: null, considered: 0, passed: 0 };
-  perItemBest.push({ item, best: result.best });
-  diagnostics.push({ item, considered: result.considered, passed: result.passed });
+// A model outage must not read as "nothing worth replacing".
+const aiFailures = chosen.filter((c) => !c.ok && c.error?.startsWith(AI_ERROR_PREFIX));
+if (aiFailures.length) {
+  console.error(`\nThe model failed on ${aiFailures.length} of ${items.length} items:`);
+  console.error(`  ${aiFailures[0].error}`);
+  console.error('\nThere is no rule-based fallback. Fix the API access and re-run.\n');
+  process.exit(1);
+}
 
-  if (!result.best) {
-    const lookup = lookups[index];
-    const candidates = lookup.ok && lookup.value ? lookup.value : [];
-    const scored = candidates.map((c) => scoreCandidate(item, c, item.quantity));
-    const nearest = scored.filter((s) => s.saving > 0).sort((a, b) => b.finalScore - a.finalScore)[0];
-    if (nearest) nearMisses.push({ item, nearest });
-  }
+const selected: SelectedItem[] = items.map((item, index) => {
+  const result = chosen[index].ok ? chosen[index].value! : { considered: 0, selection: null, candidate: null };
+  diagnostics.push({ item, considered: result.considered, offered: result.candidate ? 1 : 0 });
+  return { item, candidate: result.candidate, selection: result.selection };
 });
 
-console.log(`  ${confirmationCalls} availability checks · ${skippedUnavailable} candidates dropped as unavailable`);
+console.log(`  ${modelCalls} model calls · ${confirmationCalls} availability checks · ${skippedUnavailable} dropped as unavailable`);
 
-const rawPlan = buildPlan(items, perItemBest, loyalty);
-
-/* 5b. Semantic check: does the swap preserve the purchase intent? */
-console.log('Checking whether replacements preserve the purchase intent');
-const ranking = await rankWithAI(rawPlan.replacements);
-console.log(`  ${ranking.usedAI ? 'model: claude-sonnet-5' : `deterministic fallback — ${ranking.reason}`}`);
-const plan = applyDecisions(rawPlan, ranking.decisions);
+const plan = buildPlan(items, selected, loyalty);
 
 /* 6. Report */
 const summary = plan.summary;
@@ -210,7 +243,7 @@ plan.replacements.forEach((r, i) => {
   console.log(`   ${money(r.originalPrice)}  ${r.originalRatio ?? ''}`);
   console.log(`   → ${r.replacementName}`);
   console.log(`   ${money(r.replacementPrice)}${r.onPromotion ? '  [promotion]' : ''}`);
-  console.log(`   saving ${money(r.saving)} (−${r.savingPct}%) · score ${r.finalScore} [similarity ${r.scores.similarityScore}]`);
+  console.log(`   saving ${money(r.saving)} (−${r.savingPct}%)`);
   if (r.aiReason) console.log(`   ${r.aiReason} (confidence ${r.aiConfidence})`);
   if (r.verifySize) console.log('   WARNING: verify the pack size — the price drop is suspiciously large');
   console.log('');
@@ -226,27 +259,20 @@ if (plan.rejectedByAI?.length) {
   }
 }
 
-if (nearMisses.length) {
-  console.log('─'.repeat(72));
-  console.log('Cheaper but filtered out by the deterministic rules:\n');
-  for (const { item, nearest } of nearMisses.slice(0, 8)) {
-    const reasons: string[] = [];
-    if (nearest.scores.similarityScore < 0.35) reasons.push(`different product (similarity ${nearest.scores.similarityScore})`);
-    if (nearest.unitSavingPct != null && nearest.unitSavingPct <= 0) reasons.push(`more expensive per unit (${nearest.unitSavingPct}%)`);
-    if (nearest.sizeRatio != null && (nearest.sizeRatio > 2 || nearest.sizeRatio < 0.5)) reasons.push(`different size (×${nearest.sizeRatio})`);
-    if (!reasons.length) reasons.push(`score ${nearest.finalScore} below threshold`);
-    console.log(`• ${item.name.slice(0, 46)}`);
-    console.log(`  → ${nearest.name.slice(0, 46)} — ${reasons.join(', ')}`);
-  }
-  console.log('');
-}
-
 console.log('─'.repeat(72));
 console.log('Per-item diagnostics:\n');
 for (const d of diagnostics) {
-  console.log(`  ${String(d.considered).padStart(3)} candidates → ${d.passed} kept   ${d.item.name.slice(0, 44)}`);
+  console.log(`  ${String(d.considered).padStart(3)} candidates → ${d.offered} offered   ${d.item.name.slice(0, 44)}`);
 }
-console.log(`\n${stats.calls} MCP calls · ${stats.retries} retries · ${stats.refreshes} refreshes · ${((Date.now() - startedAt) / 1000).toFixed(1)} s\n`);
+console.log(`\n${stats.calls} MCP calls · ${stats.retries} retries · ${stats.refreshes} refreshes · ${((Date.now() - startedAt) / 1000).toFixed(1)} s`);
+
+// cacheReads at 0 means the system-prompt cache silently stopped working.
+const cached = aiStats.cacheReads + aiStats.cacheWrites + aiStats.inputTokens;
+console.log(
+  `${aiStats.calls} model calls · in ${aiStats.inputTokens} · out ${aiStats.outputTokens}` +
+    ` · cache write ${aiStats.cacheWrites} · cache read ${aiStats.cacheReads}` +
+    ` (${cached ? Math.round((aiStats.cacheReads / cached) * 100) : 0}% of prompt served from cache)\n`,
+);
 
 if (process.argv.includes('--json')) {
   mkdirSync(resolve(ROOT, '.secrets'), { recursive: true });

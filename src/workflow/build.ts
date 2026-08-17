@@ -30,17 +30,16 @@ const outFile = (name: string) => resolve(ROOT, 'workflows', name);
 const DEFAULT_BASE_URL = PLACEHOLDERS.baseUrl;
 
 /**
- * Whether to include the Anthropic call in the workflow.
+ * The Anthropic call is no longer a separate node, and there is no flag to turn
+ * it off.
  *
- * With no Anthropic credential configured, n8n fails the node outright ("no
- * credentials set") rather than routing through `onError`, so the node is left
- * out entirely instead. `Apply AI Decisions` then receives the prompt item,
- * finds no model response in it, and applies the rule-based fallback — the same
- * path a failed API call takes.
- *
- * Flip to true once the credential exists, then `npm run build:workflows`.
+ * The model is the engine now: it chooses each replacement and computes each
+ * figure, so a run without it has nothing to propose. It therefore lives inside
+ * the `Optimize Cart` Code node, which already has an HTTP transport, and reads
+ * its key from the `ANTHROPIC_API_KEY` variable rather than a credential —
+ * Code nodes cannot read credentials. A missing key fails the run with a plain
+ * message instead of silently proposing nothing.
  */
-const AI_SEMANTIC_CHECK = false;
 
 /** Strips TypeScript types and module syntax so the result runs in a Code node. */
 function inlineModule(relativePath: string): string {
@@ -55,7 +54,15 @@ function inlineModule(relativePath: string): string {
     .trim();
 }
 
-const OPTIMIZER = inlineModule('src/lib/optimizer.ts');
+/**
+ * The decision engine, inlined into the Code node that runs it.
+ *
+ * `src/lib/ai-ranker.ts` replaced the hand-written scorer: the model chooses
+ * the replacement and computes every figure. The module reaches the network
+ * through an injectable fetcher, so the node calls `setFetcher(httpFetch)`
+ * before using it — the sandbox has no global `fetch`.
+ */
+const AI_RANKER = inlineModule('src/lib/ai-ranker.ts');
 
 /**
  * The presentation layer, inlined the same way the engine is.
@@ -130,6 +137,7 @@ const TABLES = {
       expires_at: 'string',
       refresh_token_enc: 'string',
       blocked_brands: 'string',
+      size_tolerance: 'string',
     },
   },
   plans: {
@@ -228,38 +236,6 @@ const stringCondition = (value: string) => ({
   conditions: [{ operator: { type: 'string', operation: 'equals' }, leftValue: '={{ $json.action }}', rightValue: value }],
 });
 
-/**
- * A wish printed under the result, the way Silpo prints one at the bottom of a
- * till receipt.
- *
- * These are written for this project in that spirit — the real receipt texts are
- * Silpo's own, produced by their in-house authors, and are not reproduced here.
- * A couple of lines react to how the run went so the note does not feel bolted
- * on; the rest are drawn at random.
- */
-const RECEIPT_WISHES = `
-const WISHES = [
-  'Нехай попереду буде тиждень, у якому все складається легше, ніж здавалося.',
-  'Найсмачніше в цьому кошику — те, що ви приготуєте самі.',
-  'Дрібні заощадження мають звичку перетворюватися на великі радощі.',
-  'Завтра трапиться щось приємне. Дрібниця, але точно вчасно.',
-  'Хтось сьогодні згадає вас добрим словом. Можливо, за вечерю.',
-  'Хороший день починається просто: смачно поїсти й нікуди не поспішати.',
-  'Нехай удома на вас чекає тиша або сміх — залежно від того, чого більше хочеться.',
-  'Іноді найкращий план на вечір — це добре повечеряти.',
-  'Ви щойно виграли трохи часу для себе. Витратьте його без користі.',
-  'Те, що ви шукали, знайдеться. Найімовірніше, на нижній полиці.',
-  'У цьому тижні буде день, який захочеться запам’ятати. Не пропустіть його.',
-  'Смак дому не залежить від ціни. Але приємно, коли він ще й вигідний.'
-];
-
-function pickWish(saving, applied) {
-  if (applied === 0) return 'Ваш кошик уже такий, як треба. Як і цей день.';
-  if (saving >= 150) return 'Такою економією можна пишатися. Або мовчки купити собі каву.';
-  if (saving > 0 && saving < 10) return 'Навіть маленька економія — це привід зробити собі щось приємне.';
-  return WISHES[Math.floor(Math.random() * WISHES.length)];
-}
-`;
 
 /**
  * Brand comparison across alphabets.
@@ -657,6 +633,7 @@ for (const item of $input.all()) {
   let planId = null;
 
   let toggleIndex = null;
+  let sizeChoice = '';
   let brandArg = null;
   let brandIndex = null;
   // Disconnecting is confirmed by a tap, so the same action arrives twice: once
@@ -678,6 +655,11 @@ for (const item of $input.all()) {
     }
     if (action === 'bradd') action = 'brandAdd';
     if (action === 'brands') action = 'blocked';
+    if (action === 'sizes') {
+      // 'sizes:' opens the screen; 'sizes:<preset>' saves a choice.
+      sizeChoice = parts[1] || '';
+      action = sizeChoice ? 'sizeSet' : 'sizes';
+    }
     if (action === 'logout') {
       planId = null;
       logoutConfirm = parts[1] === 'yes';
@@ -709,6 +691,7 @@ for (const item of $input.all()) {
     action,
     planId,
     toggleIndex,
+    sizeChoice,
     brandArg,
     brandIndex,
     logoutConfirm,
@@ -743,7 +726,7 @@ return items;
       `
 ${READ_VAR}
 ${TELEGRAM_API}
-const SELF_ACKING = ['home', 'settings', 'about', 'blocked', 'block', 'unblock', 'brandAdd', 'brandRemove'];
+const SELF_ACKING = ['home', 'settings', 'about', 'blocked', 'block', 'unblock', 'brandAdd', 'brandRemove', 'sizes', 'sizeSet'];
 
 return $input.all()
   .filter(i => i.json.callbackQueryId && SELF_ACKING.indexOf(i.json.action) === -1)
@@ -807,7 +790,11 @@ return routed.map(r => {
   const blockedBrands = row && row.blocked_brands
     ? String(row.blocked_brands).split('|').map(b => b.trim()).filter(Boolean)
     : [];
-  return { json: { ...r, authorized: Boolean(session), session, blockedBrands } };
+  // Unknown or absent falls back to 'normal' - never to the widest band.
+  const allowed = ['strict', 'normal', 'loose'];
+  const raw = row && row.size_tolerance ? String(row.size_tolerance) : '';
+  const sizeTolerance = allowed.indexOf(raw) !== -1 ? raw : 'normal';
+  return { json: { ...r, authorized: Boolean(session), session, blockedBrands, sizeTolerance } };
 });
 `,
       { x: 60, y: 0 },
@@ -838,6 +825,11 @@ return routed.map(r => {
             { conditions: stringCondition('brandRemove'), outputKey: 'brandRemove' },
             { conditions: stringCondition('brandAdd'), outputKey: 'brandAdd' },
             { conditions: stringCondition('home'), outputKey: 'home' },
+            // Appended after 'home' on purpose: every index below is positional,
+            // and inserting earlier would silently re-route existing branches.
+            // Only the fallback index moves, and the validator checks it.
+            { conditions: stringCondition('sizes'), outputKey: 'sizes' },
+            { conditions: stringCondition('sizeSet'), outputKey: 'sizeSet' },
           ],
         },
         options: { fallbackOutput: 'extra', renameFallbackOutput: 'other' },
@@ -1034,11 +1026,21 @@ return [{ json: { url: telegramApiUrl('sendMessage'),
       'Optimize Cart',
       `
 ${MCP_CLIENT}
+${READ_VAR}
 ${BRAND_HELPERS}
-${OPTIMIZER}
+${AI_RANKER}
 
 const input = $('Merge Session').first().json;
 const mcp = createMcp(input.session);
+
+// The engine is the model. There is no rule-based fallback to degrade into, so
+// a missing key fails the run here rather than silently proposing nothing.
+const API_KEY = readVar('ANTHROPIC_API_KEY');
+if (!API_KEY) {
+  throw new Error('ANTHROPIC_API_KEY variable is not set (Settings → Variables, scope Global)');
+}
+// The sandbox has no global fetch; hand the engine the transport that works.
+setFetcher(httpFetch);
 
 // Cart: always start from the active cart id, then load the full cart.
 const { shoppingCartId } = await mcp.call('silpo_get_my_shopping_cart', {});
@@ -1104,34 +1106,71 @@ if (unavailable.length) {
   } catch (e) { /* replacements are optional */ }
 }
 
-// Deterministic scoring — prices come only from the MCP responses.
+// The model chooses. Prices still come only from MCP responses; the model reads
+// them and computes the savings.
 //
 // silpo_get_similar_products reports availability that is out of date:
 // observed available:true / stock:1 for a product that get_product_details and
 // the cart both reported as unavailable. The details call agrees with the cart,
-// so the chosen candidate is re-checked there before it is ever shown, and the
-// next-best one is used when it fails.
-const CONFIRM_ATTEMPTS = 4;
+// so each chosen candidate is re-checked there, and a candidate that fails is
+// removed from the pool before the model is asked again.
+// Two phases, each at the concurrency its own limit allows.
+//
+// The first version interleaved them and asked the model again for every
+// runner-up: 3-4 model calls per line, ~50 per cart, and n8n killed the node
+// with "Task execution timed out after 60 seconds". One call now returns a
+// ranked shortlist, and the two services are no longer throttled together —
+// working rule 15 caps Silpo at 3, it says nothing about Anthropic.
+const MODEL_CONCURRENCY = 6;
+const SILPO_CONCURRENCY = 3;
 const MAX_OPTIONS = 3;
 const blockedBrands = (input.blockedBrands || []).filter(Boolean);
 // Cheap pre-filter on the name; the authoritative check is on the attribute.
 const isBlockedName = name => blockedBrands.some(b => normalizeBrand(name).indexOf(normalizeBrand(b)) !== -1);
 
-const bestResults = await mapLimit(items, 3, async (item, i) => {
+// Phase 1 - the model chooses, one call per line.
+const pools = items.map((item, i) => {
   const candidates = lookups[i] && lookups[i].ok ? lookups[i].value : [];
-  const ranked = candidates
-    .map(raw => ({ raw, scored: scoreCandidate(item, raw, item.quantity) }))
-    .filter(x => filterCandidates(item, [x.scored], item.quantity).length > 0)
-    // Cheap pass first: drop obvious matches before spending a details call.
-    .filter(x => !isBlockedName(x.raw.name))
-    .sort((a, b) => b.scored.finalScore - a.scored.finalScore);
+  // similar_products returns the original product itself as a candidate.
+  //
+  // Candidates priced at or above the original are dropped before the prompt is
+  // built. Not a judgement the model should make: a replacement must save money
+  // to be one, so those rows cannot become an answer - they only make the
+  // prompt longer and the call slower, which is what blew the 60 s timeout.
+  return candidates.filter(c =>
+    c.id !== item.productId
+    && c.available
+    && (c.stock || 0) >= item.quantity
+    && c.price < item.price
+    && !isBlockedName(c.name));
+});
 
-  const confirmedOptions = [];
-  for (const candidate of ranked.slice(0, CONFIRM_ATTEMPTS)) {
+const picks = await mapLimit(items, MODEL_CONCURRENCY, async (item, i) => {
+  if (!pools[i].length) return null;
+  return await selectReplacement(item, pools[i], API_KEY, input.sizeTolerance);
+});
+
+// Phase 2 - Silpo confirms availability, price and brand.
+//
+// silpo_get_similar_products reports availability that is out of date: observed
+// available:true / stock:1 for a product that get_product_details and the cart
+// both reported as unavailable. Details agrees with the cart, so every candidate
+// is re-checked there before it can be shown.
+const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => {
+  const selection = picks[i] && picks[i].ok ? picks[i].value : null;
+  if (!selection || selection.chosen == null) return null;
+
+  const order = [selection.chosen].concat(selection.alternates || []);
+  const confirmed = [];
+  for (const idx of order) {
+    if (confirmed.length >= MAX_OPTIONS) break;
+    const candidate = pools[i][idx];
+    if (!candidate) continue;
+
     let details;
     try {
       details = await mcp.call('silpo_get_product_details', {
-        branchId, deliveryType, timeslotStart, timeslotEnd, slug: candidate.raw.slug,
+        branchId, deliveryType, timeslotStart, timeslotEnd, slug: candidate.slug,
       });
     } catch (e) {
       continue; // cannot confirm - do not risk it
@@ -1144,50 +1183,52 @@ const bestResults = await mapLimit(items, 3, async (item, i) => {
     const brand = (product.attributes || {})['Торгова марка'] || null;
     if (brand && blockedBrands.some(b => brandMatches(brand, b))) continue;
 
-    // Details also carries the fresher price, so the saving is recomputed
-    // against it rather than against the stale search result.
-    const confirmedRaw = Object.assign({}, candidate.raw, {
-      price: product.price != null ? product.price : candidate.raw.price,
-      oldPrice: product.oldPrice != null ? product.oldPrice : candidate.raw.oldPrice,
+    const confirmedCandidate = Object.assign({}, candidate, {
+      price: product.price != null ? product.price : candidate.price,
+      oldPrice: product.oldPrice != null ? product.oldPrice : candidate.oldPrice,
       stock: product.stock,
       available: true,
+      brand,
     });
-    const rescored = scoreCandidate(item, confirmedRaw, item.quantity);
-    if (!filterCandidates(item, [rescored], item.quantity).length) continue;
-    rescored.brand = brand;
-    // Keep the runners-up: pack size only becomes visible once an item is in
-    // the cart, so the apply step needs something to fall back to.
-    confirmedOptions.push(rescored);
-    if (confirmedOptions.length >= MAX_OPTIONS) break;
+    // Computed here, from the price details just confirmed - not from the search
+    // result and not by the model.
+    const numbers = computeSaving(item, confirmedCandidate);
+    confirmed.push({
+      candidate: confirmedCandidate,
+      saving: numbers.saving,
+      savingPct: numbers.savingPct,
+      isTopPick: idx === selection.chosen,
+    });
   }
-  if (!confirmedOptions.length) return null;
+  if (!confirmed.length) return null;
 
-  // A candidate flagged verifySize is one the semantic layer will refuse, so
-  // leading with it costs the line its replacement entirely even when a clean
-  // alternative sits right behind. Safe options first, score second; the
-  // suspicious one stays available as a last-resort alternate.
-  confirmedOptions.sort((a, b) =>
-    (a.suspiciousDrop ? 1 : 0) - (b.suspiciousDrop ? 1 : 0) || b.finalScore - a.finalScore);
-
-  const best = confirmedOptions[0];
-  best.alternates = confirmedOptions.slice(1).map(c => ({
-    productId: c.productId,
-    companyId: c.companyId,
-    branchId: c.branchId,
-    name: c.name,
-    price: c.price,
-    saving: c.saving,
-    brand: c.brand || null,
+  // The model's own numbers travel with whichever candidate is actually used,
+  // so a promoted runner-up never inherits the top pick's saving.
+  const best = confirmed[0];
+  const enrichedSelection = Object.assign({}, selection, {
+    // Confidence and reason describe the top pick only; a promoted runner-up
+    // says so plainly rather than borrowing words written about another product.
+    reason: best.isTopPick ? selection.reason : 'Запасний варіант — основний виявився недоступним',
+    confidence: best.isTopPick ? selection.confidence : Math.min(selection.confidence, 0.6),
+  });
+  best.candidate.alternates = confirmed.slice(1).map(o => ({
+    productId: o.candidate.id,
+    companyId: o.candidate.companyId,
+    branchId: o.candidate.branchId,
+    name: o.candidate.name,
+    price: o.candidate.price,
+    saving: o.saving,
+    brand: o.candidate.brand || null,
   }));
-  return best;
+  return { candidate: best.candidate, selection: enrichedSelection };
 });
 
-const perItemBest = items.map((item, i) => ({
-  item,
-  best: bestResults[i] && bestResults[i].ok ? bestResults[i].value : null,
-}));
+const selected = items.map((item, i) => {
+  const r = bestResults[i] && bestResults[i].ok ? bestResults[i].value : null;
+  return { item, candidate: r ? r.candidate : null, selection: r ? r.selection : null };
+});
 
-const plan = buildPlan(items, perItemBest, cartResponse.loyalty || {});
+const plan = buildPlan(items, selected, cartResponse.loyalty || {});
 
 return [{ json: {
   chatId: input.chatId,
@@ -1199,6 +1240,7 @@ return [{ json: {
   promotionsCount: ((promotions && promotions.promotions) || []).length,
   couponsCount: ((coupons && coupons.coupons) || []).length,
   refreshedTokens: mcp.getRefreshed(),
+  sizeTolerance: input.sizeTolerance || 'normal',
   ...plan,
 } }];
 `,
@@ -1242,159 +1284,23 @@ return [{ json: {
 
   nodes.push(
     codeNode(
-      'Build AI Prompt',
+      'Finalize Plan',
       `
-// The prompt is Ukrainian on purpose: product names and the reasons shown to
-// the customer are Ukrainian, so the model should reason in the same language.
-const SYSTEM_PROMPT = \`Ти — асистент, який перевіряє заміни товарів у кошику супермаркету «Сільпо».
-
-ТВОЯ ЄДИНА ЗАДАЧА: вирішити, чи зберігає запропонована заміна СУТЬ покупки.
-
-ПРИЙМАЙ, якщо товар виконує ту саму роль:
-- молоко 2.5% -> інше молоко 2.5%
-- макарони -> макарони іншого бренду
-- куряче філе -> куряче філе
-
-ВІДХИЛЯЙ, якщо змінюється призначення товару:
-- протеїновий/спортивний -> звичайний солодкий
-- молоко -> рослинний напій (і навпаки)
-- комбуча -> звичайний сік або газованка
-- безлактозний/безглютеновий -> звичайний (дієтичне обмеження)
-- дитяче харчування -> недитяче
-- без цукру -> із цукром
-
-ОСОБЛИВА УВАГА: дані «Сільпо» НЕ містять об'єму кандидатів. Якщо ціна падає
-більш ніж на 50%, це може бути менша упаковка. Тоді confidence не вище 0.6
-і згадай про перевірку об'єму в reason.
-
-ВІДПОВІДАЙ ВИКЛЮЧНО JSON, без markdown:
-{"decisions":[{"index":0,"accept":true,"confidence":0.85,"reason":"..."}]}
-reason — українською, до 90 символів.\`;
-
+// Every decision and every figure was produced by the model in Optimize Cart.
+// This node only gives the plan an id and trims it down to what the apply step
+// will need, so nothing extra is persisted.
 const plan = $json;
-const lines = (plan.replacements || []).map((r, i) =>
-  '[' + i + '] було: ' + r.originalName + (r.originalRatio ? ' (' + r.originalRatio + ')' : '')
-  + ' | стане: ' + r.replacementName
-  + ' | падіння ціни: ' + r.savingPct + '%' + (r.verifySize ? ' ПІДОЗРІЛО ВЕЛИКЕ' : '')
-  + (r.onPromotion ? ' | за акцією' : ''));
+const kept = plan.replacements || [];
+const rejected = plan.rejectedByAI || [];
+const summary = plan.summary;
 
-return [{ json: { ...plan,
-  aiSystemPrompt: SYSTEM_PROMPT,
-  aiUserPrompt: 'Перевір ці ' + lines.length + ' замін.\\n\\n' + lines.join('\\n'),
-}}];
-`,
-      { x: 1180, y: -240 },
-    ),
-  );
-  link('Cart Is Empty?', 'Build AI Prompt', 1);
-
-  if (AI_SEMANTIC_CHECK) {
-    nodes.push(
-      makeNode(
-        'AI Semantic Check',
-        'n8n-nodes-base.httpRequest',
-        {
-        method: 'POST',
-        url: 'https://api.anthropic.com/v1/messages',
-        authentication: 'predefinedCredentialType',
-        nodeCredentialType: 'anthropicApi',
-        sendHeaders: true,
-        headerParameters: { parameters: [{ name: 'anthropic-version', value: '2023-06-01' }] },
-        sendBody: true,
-        specifyBody: 'json',
-        jsonBody: `={{ JSON.stringify({
-      model: 'claude-sonnet-5',
-      max_tokens: 2000,
-      system: $json.aiSystemPrompt,
-      messages: [{ role: 'user', content: $json.aiUserPrompt }]
-    }) }}`,
-        options: { timeout: 30000 },
-      },
-        {
-          typeVersion: 4.2,
-          x: 1400,
-          y: -240,
-          credentials: { anthropicApi: { id: 'SILPO_AI', name: 'Anthropic API' } },
-          onError: 'continueRegularOutput',
-        },
-      ),
-    );
-    link('Build AI Prompt', 'AI Semantic Check');
-  }
-
-  nodes.push(
-    codeNode(
-      'Apply AI Decisions',
-      `
-${OPTIMIZER}
-// The model only decides accept/reject. Every total below is recomputed here,
-// so a hallucinated number can never reach the customer.
-const plan = $('Build AI Prompt').first().json;
-const replacements = plan.replacements || [];
-
-// Rule-based fallback for a missing key, an API error or malformed output.
-function fallback(list) {
-  const RED_FLAGS = [
-    [/протеїн|protein|nutri|profeel/i, 'оригінал — протеїновий продукт'],
-    [/безлактозн/i, 'оригінал — безлактозний'],
-    [/без цукру|безглютен|без глютен/i, 'оригінал має дієтичне обмеження'],
-    [/комбуч/i, 'оригінал — ферментований напій'],
-    [/дитяч|milupa/i, 'оригінал — дитяче харчування'],
-  ];
-  return list.map((r, index) => {
-    let blocker = null;
-    for (const [pattern, label] of RED_FLAGS) {
-      if (pattern.test(r.originalName) && !pattern.test(r.replacementName)) { blocker = label; break; }
-    }
-    const accept = !blocker && r.finalScore >= 0.6 && !r.verifySize;
-    return { index, accept,
-      confidence: accept ? Math.min(0.75, r.finalScore) : 0.3,
-      reason: accept ? 'Схожий товар тієї ж категорії' + (r.onPromotion ? ', за акцією' : '')
-        : (blocker || (r.verifySize ? 'Підозріло велике падіння ціни — можлива менша упаковка' : 'Недостатня схожість')),
-      source: 'fallback' };
-  });
-}
-
-let decisions = null;
-try {
-  const response = $input.first().json;
-  const textPart = (response.content || []).find(c => c.type === 'text');
-  if (textPart) {
-    const parsed = JSON.parse(String(textPart.text).replace(/^\\\`\\\`\\\`(?:json)?|\\\`\\\`\\\`$/g, '').trim());
-    const byIndex = new Map((parsed.decisions || []).map(d => [d.index, d]));
-    decisions = replacements.map((r, i) => {
-      const decision = byIndex.get(i);
-      if (!decision) return fallback([r])[0];
-      return { index: i, accept: Boolean(decision.accept),
-        confidence: Math.max(0, Math.min(1, Number(decision.confidence) || 0)),
-        reason: String(decision.reason || '').slice(0, 120), source: 'ai' };
-    });
-  }
-} catch (e) { decisions = null; }
-if (!decisions) decisions = fallback(replacements);
-
-const kept = [], rejected = [];
-replacements.forEach((r, i) => {
-  const decision = decisions[i];
-  const enriched = { ...r, aiReason: decision.reason, aiConfidence: decision.confidence, aiSource: decision.source };
-  (decision.accept && decision.confidence >= 0.5 ? kept : rejected).push(enriched);
-});
-
-const saving = round2(kept.reduce((sum, r) => sum + r.saving, 0));
-const originalTotal = plan.summary.originalTotal;
-
-const summary = { ...plan.summary,
-  replacementsFound: kept.length,
-  promotionsUsed: kept.filter(r => r.onPromotion).length,
-  optimizedTotal: round2(originalTotal - saving),
-  saving,
-  savingPct: originalTotal > 0 ? round2(saving / originalTotal * 100) : 0,
-};
-
-// Only what the apply step actually needs is persisted — scores and diagnostics
-// stay in memory. Keeps the stored row small and leaks less into storage.
+// Only what the apply step actually needs is persisted — reasons and
+// diagnostics stay in memory. Keeps the stored row small and leaks less.
 const stored = {
   shoppingCartId: plan.shoppingCartId,
+  // The band this plan was judged against. Read back at apply time so changing
+  // the setting mid-flight cannot silently re-judge a plan the guest already saw.
+  sizeTolerance: plan.sizeTolerance || 'normal',
   // Indices the guest wants applied; everything is selected by default.
   selected: kept.map((r, i) => i),
   replacements: kept.map(r => ({
@@ -1416,7 +1322,12 @@ const stored = {
   })),
   // bonusAvailable is stored because the card is re-rendered on every tick, and
   // without it the bonus note vanished after the guest's first tap.
-  summary: { originalTotal, saving, itemsAnalyzed: plan.summary.itemsAnalyzed, bonusAvailable: plan.summary.bonusAvailable },
+  summary: {
+    originalTotal: summary.originalTotal,
+    saving: summary.saving,
+    itemsAnalyzed: summary.itemsAnalyzed,
+    bonusAvailable: summary.bonusAvailable,
+  },
 };
 
 // Telegram caps callback_data at 64 bytes, and a toggle carries plan id plus an
@@ -1428,15 +1339,15 @@ return [{ json: { ...plan,
   planId: shortId,
   replacements: kept,
   rejectedByAI: rejected,
-  aiSource: decisions[0] ? decisions[0].source : 'none',
+  aiSource: 'ai',
   storedPlan: JSON.stringify(stored),
   summary,
 }}];
 `,
-      { x: 1620, y: -240 },
+      { x: 1180, y: -240 },
     ),
   );
-  link(AI_SEMANTIC_CHECK ? 'AI Semantic Check' : 'Build AI Prompt', 'Apply AI Decisions');
+  link('Cart Is Empty?', 'Finalize Plan', 1);
 
   nodes.push(
     dataTableNode(
@@ -1456,7 +1367,7 @@ return [{ json: { ...plan,
       { x: 1840, y: -240 },
     ),
   );
-  link('Apply AI Decisions', 'Save Plan');
+  link('Finalize Plan', 'Save Plan');
 
   nodes.push(
     codeNode(
@@ -1465,7 +1376,7 @@ return [{ json: { ...plan,
 ${READ_VAR}
 ${TELEGRAM_API}
 ${UI_MODULE}
-const plan = $('Apply AI Decisions').first().json;
+const plan = $('Finalize Plan').first().json;
 // Everything is selected to begin with; the guest unticks what they do not want.
 const selected = (plan.replacements || []).map((r, i) => i);
 const card = buildSelectionCard(plan, selected);
@@ -1572,6 +1483,81 @@ return requests.map(r => ({ json: {
   link('Switch Action', 'Update Blocklist', 8);
   link('Switch Action', 'Update Blocklist', 13);
   link('Switch Action', 'Update Blocklist', 14);
+
+  /* --- pack-size tolerance ------------------------------------------- */
+
+  nodes.push(
+    codeNode(
+      'Update Size',
+      `
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
+const route = $('Merge Session').first().json;
+const allowed = ['strict', 'normal', 'loose'];
+const choice = allowed.indexOf(String(route.sizeChoice || '')) !== -1 ? route.sizeChoice : 'normal';
+
+const ctx = { chatId: route.chatId, messageId: route.messageId, callbackId: route.callbackId };
+// The screen is redrawn from the choice rather than from the row: the write
+// happens in the next node, and drawing the old value would show the guest a
+// setting they did not pick.
+const requests = screenRequests(buildSizesCard(choice), ctx, 'Збережено: ' + toleranceLabel(choice));
+
+return requests.map(r => ({ json: {
+  telegramUserId: route.telegramUserId,
+  sizeValue: choice,
+  url: telegramApiUrl(r.method),
+  body: r.body,
+}}));
+`,
+      { x: 520, y: 1420 },
+    ),
+  );
+  link('Switch Action', 'Update Size', 17);
+
+  nodes.push(
+    dataTableNode(
+      'Save Size',
+      {
+        operation: 'update',
+        table: TABLES.sessions,
+        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Update Size').first().json.telegramUserId }}" }],
+        columns: { size_tolerance: "={{ $('Update Size').first().json.sizeValue }}" },
+      },
+      // Same reasons as Save Blocklist: a guest with no session row must still
+      // get a reply, and the write must happen once rather than once per API call.
+      { x: 740, y: 1420, alwaysOutputData: true, executeOnce: true },
+    ),
+  );
+  link('Update Size', 'Save Size');
+
+  nodes.push(
+    codeNode(
+      'Size Screen Requests',
+      `
+return $('Update Size').all().map(i => ({ json: { url: i.json.url, body: i.json.body } }));
+`,
+      { x: 960, y: 1420 },
+    ),
+  );
+  link('Save Size', 'Size Screen Requests');
+
+  nodes.push(
+    makeNode(
+      'Send Size',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: '={{ $json.url }}',
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: '={{ JSON.stringify($json.body) }}',
+        options: {},
+      },
+      { typeVersion: 4.2, x: 1180, y: 1420 },
+    ),
+  );
+  link('Size Screen Requests', 'Send Size');
 
   nodes.push(
     dataTableNode(
@@ -1898,7 +1884,7 @@ return [{ json: { ...row, invalid: false } }];
       'Apply Changes',
       `
 ${MCP_CLIENT}
-${OPTIMIZER}
+${AI_RANKER}
 
 // Read the row from Validate Plan by name: Claim Plan and Send Applying sit
 // between them, so $input here is a Telegram response, not the plan.
@@ -1912,6 +1898,11 @@ if (row.invalid) {
 
 const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
 const mcp = createMcp(route.session);
+
+// The band the plan was judged against, not whatever the setting says now: the
+// guest may have changed it while the card was on screen, and re-judging a plan
+// they already approved against a different rule would be a surprise.
+const band = sizeBand(plan.sizeTolerance);
 
 // Re-read the cart first: another session may have changed it since the analysis.
 const before = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId: plan.shoppingCartId });
@@ -2026,7 +2017,7 @@ for (let round = 0; round < MAX_ROUNDS; round++) {
     const newSize = line ? sizeOf(line) : null;
     if (originalSize && newSize && originalSize.unit === newSize.unit) {
       const factor = newSize.value / originalSize.value;
-      if (factor > THRESHOLDS.maxSizeRatio || factor < THRESHOLDS.minSizeRatio) {
+      if (factor > band.max || factor < band.min) {
         q.reason = 'size';
         q.detail = { name: option.name, from: q.original.ratio, to: line.ratio };
         rollback.push(option.productId);
@@ -2087,6 +2078,7 @@ const substituted = confirmed.filter(q => q.chosen.fallbackUsed)
 // Mandatory verification: the headline number must come from the cart itself.
 const after = await mcp.call('silpo_get_shopping_cart_by_id', { shoppingCartId: plan.shoppingCartId });
 const afterTotal = after.cart.calculation.total;
+const afterItems = (after.cart.shipments || []).reduce((all, s) => all.concat(s.products || []), []);
 
 return [{ json: {
   chatId: route.chatId,
@@ -2102,8 +2094,17 @@ return [{ json: {
   afterTotal,
   actualSaving: round2(beforeTotal - afterTotal),
   promisedSaving: plan.summary.saving,
+  // Names for the receipt wish. Taken from the cart already read back here, so
+  // the wish costs no extra MCP call.
+  cartNames: afterItems.map(p => p.name),
   loyalty: after.loyalty || {},
-  validations: after.cart.calculation.validations || [],
+  // The raw message is an i18n key; the product name lives in context and is
+  // resolved here so ui.ts can write a sentence a guest can act on.
+  validations: (after.cart.calculation.validations || []).map(v => {
+    const pid = v.context && v.context.productId;
+    const line = pid ? afterItems.find(i => i.productId === pid) : null;
+    return { level: v.level, type: v.type, message: v.message, productName: line ? line.name : null };
+  }),
 }}];
 `,
       { x: 1400, y: 240, onError: 'continueErrorOutput' },
@@ -2189,7 +2190,9 @@ return [{ json: {
     codeNode(
       'Format Result',
       `
-${RECEIPT_WISHES}
+${READ_VAR}
+${HTTP_HELPER}
+${AI_RANKER}
 ${UI_MODULE}
 // The headline number is the actual cart total after the change, read back from
 // Silpo — never the prediction the card showed.
@@ -2197,7 +2200,28 @@ const result = $('Apply Changes').first().json;
 
 if (result.expired) return [{ json: { chatId: result.chatId, text: result.text } }];
 
-const text = buildResultText(result, pickWish(result.actualSaving, result.applied));
+// The wish is the one model call that is allowed to fail quietly. The cart has
+// already been changed at this point, so this message must reach the guest
+// whatever happens; a static line is less personal, not wrong. Anything the
+// model returns is validated first - a digit is rejected outright, because that
+// is how an unverified number would reach a guest through the one channel
+// nothing else checks.
+let wish = null;
+const wishKey = readVar('ANTHROPIC_API_KEY');
+if (wishKey) {
+  try {
+    setFetcher(httpFetch);
+    wish = validateWish(await generateWish(
+      WISH_SYSTEM_PROMPT,
+      buildWishPrompt(result.cartNames || [], result.applied),
+      wishKey,
+    ));
+  } catch (e) {
+    wish = null;
+  }
+}
+
+const text = buildResultText(result, wish || pickWish(result.actualSaving, result.applied));
 
 return [{ json: { chatId: result.chatId, text } }];
 `,
@@ -2262,17 +2286,19 @@ return screenRequests(card, ctx).map(r => ({ json: { url: telegramApiUrl(r.metho
   screenNode('Build Home', 'const card = buildHomeCard(route.authorized);', 660);
   screenNode(
     'Build Settings',
-    'const card = buildSettingsCard(route.authorized, (route.blockedBrands || []).length);',
+    'const card = buildSettingsCard(route.authorized, (route.blockedBrands || []).length, route.sizeTolerance);',
     780,
   );
   screenNode('Build About', 'const card = buildAboutCard();', 900);
   screenNode('Show Brands', 'const card = buildBrandsCard(route.blockedBrands || []);', 1020);
+  screenNode('Show Sizes', 'const card = buildSizesCard(route.sizeTolerance);', 1140);
 
   // /start and anything unrecognised land on home. The fallback output sits
   // after every rule, so its index shifts whenever a rule is added.
   link('Switch Action', 'Build Home', 15);
-  link('Switch Action', 'Build Home', 16);
+  link('Switch Action', 'Build Home', 18);
   link('Switch Action', 'Build Settings', 11);
+  link('Switch Action', 'Show Sizes', 16);
   link('Switch Action', 'Build About', 12);
   link('Switch Action', 'Show Brands', 9);
 
@@ -2454,7 +2480,40 @@ return [{ json: { chatId: route.chatId, empty: false, text: card.text } }];
 ${UI_MODULE}
 // Never leak a stack trace to the customer — map failures to plain guidance.
 const failure = $input.first().json;
-const raw = String((failure.error && failure.error.message) || failure.message || '');
+
+// n8n does not put a failed node's message in one predictable place: depending
+// on version and node type it is json.error (a plain string), json.error.message,
+// or an Error instance whose message is non-enumerable. Reading only one shape
+// left this node with an empty string, which cost a live debugging session -
+// the guest saw the generic message with no hint, and the hint below is the
+// whole reason this branch exists. Try every shape before giving up.
+function errText(value, depth) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value;
+  if (typeof value !== 'object' || (depth || 0) > 3) return '';
+  if (typeof value.message === 'string' && value.message) return value.message;
+  if (typeof value.description === 'string' && value.description) return value.description;
+  for (const key of ['error', 'cause', 'lastNodeExecuted', 'errorMessage']) {
+    const nested = errText(value[key], (depth || 0) + 1);
+    if (nested) return nested;
+  }
+  return '';
+}
+
+let raw = errText(failure, 0);
+// $input carries the item; the execution-level error lives elsewhere again.
+if (!raw) {
+  try { raw = errText($execution && $execution.error, 0); } catch (e) { /* not exposed */ }
+}
+if (!raw) raw = 'no error message was reported by n8n';
+
+// The failing node's name narrows it down far faster than the message alone.
+let where = '';
+try {
+  where = (failure.error && failure.error.node && failure.error.node.name)
+    || (failure.node && failure.node.name) || '';
+} catch (e) { /* ignore */ }
+
 const route = $('Merge Session').first().json;
 
 let kind = 'unknown';
@@ -2469,8 +2528,8 @@ let text = buildErrorText(kind);
 if (kind === 'unknown') {
   // Not a stack trace, but enough to identify the failure without digging
   // through Executions. Unknown errors are the ones worth surfacing.
-  const hint = raw.replace(/\\s+/g, ' ').slice(0, 120);
-  if (hint) text += '\\n\\n<i>' + esc(hint) + '.</i>';
+  const hint = (where ? where + ': ' : '') + raw.replace(/\\s+/g, ' ');
+  text += '\\n\\n<i>' + esc(hint.slice(0, 200)) + '</i>';
 }
 return [{ json: { chatId: route.chatId, text } }];
 `,
