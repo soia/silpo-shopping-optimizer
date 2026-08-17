@@ -71,9 +71,13 @@ TTL checks use `createdAt`.
 >
 > - `blocked_brands` — the brand blocklist, pipe-separated. Without it `/block`
 >   fails on write.
-> - `size_tolerance` — `strict` / `normal` / `loose`, the pack-size band the
->   guest picked in Settings. Absent or unrecognised reads as `normal`, so the
->   bot keeps working without it; only the setting silently stops persisting.
+> - `size_tolerance` — the optimization mode the guest picked in Settings:
+>   `conservative` / `balanced` / `max`. The column keeps its old name because
+>   it already holds the three pack-size presets (`strict` / `normal` /
+>   `loose`) that modes replaced, and `resolveMode()` folds those onto the mode
+>   carrying the same band — so nothing needs migrating. Absent or unrecognised
+>   reads as `balanced`, so the bot keeps working without the column; only the
+>   setting silently stops persisting.
 
 > Table ids and the instance URL are compiled into the workflows. Put yours in
 > **`.secrets/n8n.json`** (gitignored) and rebuild:

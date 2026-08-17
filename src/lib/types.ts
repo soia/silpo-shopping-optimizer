@@ -98,6 +98,8 @@ export interface Replacement {
   verifySize: boolean;
   aiReason?: string | null;
   aiConfidence?: number | null;
+  /** Confidence at or above `CONFIDENT`: ticked by default, shown without a caveat. */
+  confident?: boolean;
   aiSource?: string | null;
 }
 
@@ -111,6 +113,23 @@ export interface PlanSummary {
   savingPct: number;
   /** Potential only — never counted as guaranteed saving. */
   bonusAvailable: number;
+  /**
+   * Discounts Silpo has **already** taken off this cart — `calculation.subDiscount`.
+   *
+   * Reported beside the saving and never added to it. A cart line carries
+   * `oldPrice` as the regular price and `price` with the promotion already
+   * applied, so `total` is the discounted figure: counting promotions again as
+   * something this run achieved would double-count money the guest already has.
+   */
+  cartDiscount: number;
+  /**
+   * Coupons on the account, as a count.
+   *
+   * A count and not a sum on purpose: `get_my_coupons` says nothing about which
+   * coupons apply to this cart or what they are worth, and applying one is a
+   * cart write. Shown as an opportunity to act on in the Silpo app.
+   */
+  couponsAvailable: number;
 }
 
 export interface OptimizationPlan {

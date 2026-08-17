@@ -13,7 +13,16 @@ import { writeFileSync, mkdirSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { callTool, mapLimit, stats } from '../lib/mcp.ts';
-import { selectReplacement, buildPlan, aiStats, AI_ERROR_PREFIX, type SelectedItem } from '../lib/ai-ranker.ts';
+import {
+  selectReplacement,
+  buildPlan,
+  filterCandidates,
+  rejectReason,
+  sizeBand,
+  aiStats,
+  AI_ERROR_PREFIX,
+  type SelectedItem,
+} from '../lib/ai-ranker.ts';
 import type { CartItem, ProductCandidate } from '../lib/types.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');
@@ -31,7 +40,7 @@ const money = (n: number) => `${Number(n).toFixed(2)} UAH`;
 
 // The bot reads this per guest from the session row; locally it is an env knob so
 // the three bands can be compared on the same cart.
-const TOLERANCE = process.env.SIZE_TOLERANCE ?? 'normal';
+const MODE = process.env.MODE ?? process.env.SIZE_TOLERANCE ?? 'balanced';
 
 /* 1. Cart */
 console.log('\nAnalyzing cart…\n');
@@ -123,7 +132,7 @@ if (unavailable.length) {
 
 /* 5. The model chooses. Every judgement and every number below is its own. */
 console.log('Choosing replacements');
-console.log(`  model: claude-sonnet-5 · size tolerance: ${TOLERANCE}`);
+console.log(`  model: claude-sonnet-5 · mode: ${MODE}`);
 
 /**
  * `silpo_get_similar_products` reports stale availability — observed
@@ -142,22 +151,49 @@ let skippedUnavailable = 0;
 // out at 60 s.
 const MODEL_CONCURRENCY = 6;
 
+/**
+ * The deterministic gate, ahead of the model.
+ *
+ * Everything it removes is removed on a fact the API states — a price quoted on
+ * another basis, a pack outside the band, a grade that differs — never on a
+ * judgement about what the product is for. That judgement stays with the model,
+ * which now sees a shorter, honest pool.
+ */
+const band = sizeBand(MODE);
+const gateTally: Record<string, number> = {};
 const pools = items.map((item, index) => {
   const lookup = lookups[index];
   const all = lookup.ok && lookup.value ? lookup.value : [];
-  // `similar_products` returns the original product itself as a candidate.
-  //
-  // Candidates priced at or above the original are dropped before the prompt is
-  // built. This is not a judgement the model should be making: a replacement
-  // must save money to be a replacement at all, so those rows cannot become an
-  // answer — they only make the prompt longer and the call slower.
-  return all.filter(
-    (c) => c.id !== item.productId && c.available && (c.stock ?? 0) >= item.quantity && c.price < item.price,
-  );
+  const { kept, rejected } = filterCandidates(item, all, band);
+  for (const [reason, count] of Object.entries(rejected)) {
+    gateTally[reason] = (gateTally[reason] ?? 0) + count;
+  }
+  return kept;
 });
 
+/**
+ * `--dump` writes the cart and every candidate pool to `.secrets/fixture.json`
+ * and stops before the model runs.
+ *
+ * The point is to stop paying for a live run to answer a question about the
+ * data. Selection quality is judged against real Silpo payloads — weighted
+ * lines, `displayRatio`, prices that turn out to be on different bases — and
+ * those payloads do not change often enough to re-fetch per experiment. The
+ * dump costs MCP reads only: no model call, and no write tool, same as the rest
+ * of this file.
+ */
+if (process.argv.includes('--dump')) {
+  mkdirSync(resolve(ROOT, '.secrets'), { recursive: true });
+  writeFileSync(
+    resolve(ROOT, '.secrets/fixture.json'),
+    JSON.stringify({ capturedAt: new Date().toISOString(), branchId, deliveryType, items, pools }, null, 2),
+  );
+  console.log(`\nFixture written to .secrets/fixture.json — ${items.length} lines, ${pools.reduce((n, p) => n + p.length, 0)} candidates\n`);
+  process.exit(0);
+}
+
 const picks = await mapLimit(items, MODEL_CONCURRENCY, async (item, index) =>
-  pools[index].length ? await selectReplacement(item, pools[index], API_KEY, TOLERANCE) : null,
+  pools[index].length ? await selectReplacement(item, pools[index], API_KEY, MODE) : null,
 );
 const modelCalls = pools.filter((p) => p.length).length;
 
@@ -166,9 +202,12 @@ const chosen = await mapLimit(items, CONCURRENCY, async (item, index) => {
   const selection = picks[index].ok ? picks[index].value : null;
   if (!selection || selection.chosen == null) return { considered, selection: null, candidate: null };
 
-  const order = [selection.chosen, ...selection.alternates];
-  for (const idx of order) {
-    const candidate = pools[index][idx];
+  const order = [
+    { index: selection.chosen, reason: selection.reason, confidence: selection.confidence },
+    ...selection.alternates,
+  ];
+  for (const option of order) {
+    const candidate = pools[index][option.index];
     if (!candidate) continue;
     confirmationCalls++;
     let details: any;
@@ -190,17 +229,25 @@ const chosen = await mapLimit(items, CONCURRENCY, async (item, index) => {
       continue;
     }
 
+    const confirmed = {
+      ...candidate,
+      price: product.price ?? candidate.price,
+      oldPrice: product.oldPrice ?? candidate.oldPrice,
+      stock: product.stock,
+      available: true,
+      brand: details.product?.attributes?.['Торгова марка'] ?? null,
+    } as ProductCandidate;
+
+    // The gate again, on the confirmed price: details overrides the search
+    // price, and the model's approval does not make a now-worse swap valid.
+    if (rejectReason(item, confirmed, band)) continue;
+
+    // The verdict the model wrote about *this* option, not about the one it
+    // ranked first and Silpo could not confirm.
     return {
       considered,
-      selection,
-      candidate: {
-        ...candidate,
-        price: product.price ?? candidate.price,
-        oldPrice: product.oldPrice ?? candidate.oldPrice,
-        stock: product.stock,
-        available: true,
-        brand: details.product?.attributes?.['Торгова марка'] ?? null,
-      } as ProductCandidate,
+      selection: { ...selection, reason: option.reason, confidence: option.confidence },
+      candidate: confirmed,
     };
   }
   return { considered, selection: null, candidate: null };
@@ -223,7 +270,22 @@ const selected: SelectedItem[] = items.map((item, index) => {
 
 console.log(`  ${modelCalls} model calls · ${confirmationCalls} availability checks · ${skippedUnavailable} dropped as unavailable`);
 
-const plan = buildPlan(items, selected, loyalty);
+// The share each rule removes is the only evidence the gate is doing anything.
+// A rule that never fires is dead code and should be said so, per working rule 9.
+const gateTotal = Object.values(gateTally).reduce((sum, n) => sum + n, 0);
+if (gateTotal) {
+  console.log(`\nHard gate rejected ${gateTotal} candidates before the model:`);
+  for (const [reason, count] of Object.entries(gateTally).sort((a, b) => b[1] - a[1])) {
+    console.log(`  ${String(count).padStart(4)}  ${reason}`);
+  }
+}
+
+const plan = buildPlan(items, selected, {
+  loyalty,
+  cartDiscount: cart.calculation.subDiscount,
+  couponsAvailable: coupons?.coupons?.length ?? 0,
+  mode: MODE,
+});
 
 /* 6. Report */
 const summary = plan.summary;

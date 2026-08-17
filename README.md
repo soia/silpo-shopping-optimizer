@@ -99,7 +99,8 @@ n8n instance to a working agent.
 | `npm run authorize` | OAuth 2.1 + PKCE flow, writes real tool schemas to `data/` |
 | `npm run optimize` | Full analysis pipeline against the live cart |
 | `npm run call -- <tool> '<json>'` | Invoke any MCP tool directly |
-| `npm run check` | Typecheck → regenerate workflows → validate them |
+| `npm run check` | Typecheck → test → regenerate workflows → validate them |
+| `npm test` | Offline tests for the gate and the arithmetic — no network |
 | `npm run test:node` | Execute a generated Code node against live MCP |
 
 ---

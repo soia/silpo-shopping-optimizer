@@ -74,9 +74,10 @@ interface UiModule {
   buildSettingsCard: (authorized: boolean, blocked: number) => Card;
   buildAboutCard: () => Card;
   buildBrandsCard: (brands: string[], notice?: string) => Card;
-  buildSizesCard: (tolerance?: string | null, notice?: string) => Card;
+  buildModeCard: (mode?: string | null, notice?: string) => Card;
   buildCartCard: (lines: unknown[], total: number, extras?: unknown) => Card;
   buildSelectionCard: (plan: unknown, selected: number[]) => Card;
+  defaultSelection: (replacements: Array<{ confident?: boolean; saving: number }>) => number[];
   buildDetailsCard: (plan: unknown, planId: string) => Card;
   buildResultText: (result: unknown, wish: string) => string;
   buildErrorText: (kind: string) => string;
@@ -99,8 +100,8 @@ function loadUi(): UiModule {
 
   const names: Array<keyof UiModule> = [
     'UI', 'BUTTON', 'COMMANDS', 'BRAND_PROMPT_MARKER',
-    'buildHomeCard', 'buildSettingsCard', 'buildAboutCard', 'buildBrandsCard', 'buildSizesCard',
-    'buildCartCard', 'buildSelectionCard', 'buildDetailsCard', 'buildResultText',
+    'buildHomeCard', 'buildSettingsCard', 'buildAboutCard', 'buildBrandsCard', 'buildModeCard',
+    'buildCartCard', 'buildSelectionCard', 'defaultSelection', 'buildDetailsCard', 'buildResultText',
     'buildErrorText', 'brandToast', 'logoutKeyboard', 'homeKeyboard',
     'screenRequests', 'brandPromptRequest',
   ];
@@ -138,17 +139,60 @@ const HOSTILE_CART = [
 
 const PLAN = {
   planId: 'k3f9a1zx4b',
-  summary: { originalTotal: 1847.4, saving: 186.12, itemsAnalyzed: 12, bonusAvailable: 45 },
+  summary: {
+    originalTotal: 1847.4, saving: 186.12, itemsAnalyzed: 12,
+    bonusAvailable: 45, cartDiscount: 344.51, couponsAvailable: 2,
+  },
   replacements: [
     {
       originalName: 'Молоко Яготинське 2,5% 900г', replacementName: 'Молоко Premia 2,5% 900г',
       originalPrice: 52.9, replacementPrice: 44.9, saving: 8, savingPct: 15, quantity: 2,
-      onPromotion: true, brand: 'PREMIA', aiReason: 'Той самий відсоток жиру та обʼєм',
+      onPromotion: true, brand: 'PREMIA', confident: true,
+      aiReason: 'Молоко тієї ж жирності 2,5%, той самий обʼєм',
     },
     {
       originalName: 'Сметана Яготинська 15% 350г', replacementName: 'Сметана «Селянська_особлива» 15% 350г',
       originalPrice: 52.99, replacementPrice: 32.99, saving: 20, savingPct: 38, quantity: 1,
-      verifySize: true, brand: 'Селянське',
+      verifySize: true, brand: 'Селянське', confident: false,
+      aiReason: 'Та сама жирність, але фасування вказане неоднозначно',
+    },
+  ],
+};
+
+/**
+ * Sixteen replacements — what a full weekly basket produces.
+ *
+ * The card had no length budget until the reason line was added to it, so this
+ * fixture is the one that would have proved the omission: past 4096 characters
+ * Telegram rejects the whole send, and the guest gets nothing at all rather than
+ * a shortened list.
+ */
+const BIG_PLAN = {
+  planId: 'big1',
+  summary: { originalTotal: 4286.86, saving: 620.5, itemsAnalyzed: 22, bonusAvailable: 34.24 },
+  replacements: Array.from({ length: 16 }, (_, index) => ({
+    originalName: `Ковбаса «Укрпромпостач» «Домашня» варена в/ґ, нарізка ${index + 1}`,
+    replacementName: `Ковбаса Алан «Особлива» варено-копчена в/ґ, нарізка ${index + 1}`,
+    originalPrice: 129.9, replacementPrice: 99.9, saving: 30, savingPct: 23, quantity: 1,
+    onPromotion: index % 3 === 0, confident: index % 4 !== 0, brand: 'Алан',
+    aiReason: 'Та сама варена ковбаса, те саме фасування, дешевше',
+  })),
+};
+
+/** A run where the model was sure of nothing: every box off, saving stated as possible. */
+const CAUTIOUS_PLAN = {
+  planId: 'c1',
+  summary: { originalTotal: 980.5, saving: 41, itemsAnalyzed: 9 },
+  replacements: [
+    {
+      originalName: 'Шинка Укрпромпостач для Сільпо Daniel с/к', replacementName: 'Рулька «Алан» «Особлива» свиняча в/к в/ґ',
+      originalPrice: 799, replacementPrice: 549, saving: 25, savingPct: 31, quantity: 0.1,
+      confident: false, aiReason: 'Копчений свинячий делікатес, але інша частина туші',
+    },
+    {
+      originalName: 'Напій слабоалкогольний «Оболонь» «Бренді Кола»', replacementName: 'Напій слабоалкогольний Pangaia Lychee&Rose',
+      originalPrice: 40.99, replacementPrice: 35.99, saving: 16, savingPct: 12, quantity: 1,
+      confident: false, onPromotion: true, aiReason: 'Той самий формат банки 0,33 л, але зовсім інший смак',
     },
   ],
 };
@@ -186,8 +230,10 @@ const SCREENS: Array<[string, Card | string]> = [
   ['cart — empty', ui.UI.cartEmpty],
   ['analysing', ui.UI.analysing],
   ['results', card],
+  ['results — sixteen replacements', ui.buildSelectionCard(BIG_PLAN, ui.defaultSelection(BIG_PLAN.replacements))],
+  ['results — nothing confident', ui.buildSelectionCard(CAUTIOUS_PLAN, ui.defaultSelection(CAUTIOUS_PLAN.replacements))],
   ['results — colliding names', ui.buildSelectionCard(COLLIDING_PLAN, [0])],
-  ['results — nothing found', ui.buildSelectionCard({ planId: 'x', summary: { originalTotal: 1847.4, itemsAnalyzed: 12, bonusAvailable: 45 }, replacements: [], slotExpired: true }, [])],
+  ['results — nothing found', ui.buildSelectionCard({ planId: 'x', summary: { originalTotal: 1847.4, itemsAnalyzed: 12, bonusAvailable: 45 }, replacements: [] }, [])],
   ['details', ui.buildDetailsCard(PLAN, PLAN.planId)],
   ['applying', ui.UI.applying],
   ['applied', ui.buildResultText(RESULT, 'Дрібні заощадження мають звичку перетворюватися на великі радощі.')],
@@ -198,9 +244,9 @@ const SCREENS: Array<[string, Card | string]> = [
   ['brands', ui.buildBrandsCard(['Премія', 'Ascania', 'Лавка традицій Lago'])],
   ['brands — empty', ui.buildBrandsCard([])],
   ['brands — after /block', ui.buildBrandsCard(['Премія', 'Ascania'], ui.brandToast('added', 'Ascania'))],
-  ['sizes', ui.buildSizesCard('normal')],
-  ['sizes — strict', ui.buildSizesCard('strict')],
-  ['sizes — after tap', ui.buildSizesCard('loose', 'Збережено: вільно')],
+  ['mode — balanced', ui.buildModeCard('balanced')],
+  ['mode — legacy value «strict»', ui.buildModeCard('strict')],
+  ['mode — after tap', ui.buildModeCard('max', 'Збережено: максимальна економія')],
   ['brand prompt', ui.UI.brandPrompt],
   ...['auth', 'rate', 'upstream', 'cart', 'unknown'].map(
     (kind) => [`error — ${kind}`, ui.buildErrorText(kind)] as [string, string],
@@ -356,7 +402,7 @@ const ENTRY_POINTS: Array<[string, unknown]> = [
   ...['optimize', 'cart', 'settings'].map(
     (key) => [`keyboard: ${ui.BUTTON[key]}`, message(ui.BUTTON[key])] as [string, unknown],
   ),
-  ...['connect:', 'optimize:', 'cart:', 'settings:', 'about:', 'home:', 'brands:', 'bradd:', 'brx:2', 'sizes:', 'sizes:loose',
+  ...['connect:', 'optimize:', 'cart:', 'settings:', 'about:', 'home:', 'brands:', 'bradd:', 'brx:2', 'sizes:', 'sizes:max',
     'apply:abc123', 'details:abc123', 'cancel:abc123', 't:abc123:4', 'logout:ask', 'logout:yes', 'logout:no',
   ].map((data) => [`button ${data}`, tap(data)] as [string, unknown]),
   ['reply to the brand prompt', message('Яготинське', { reply_to_message: { text: ui.BRAND_PROMPT_MARKER + '\n\nНаприклад: Яготинське' } })],

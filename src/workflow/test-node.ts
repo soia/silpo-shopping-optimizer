@@ -49,7 +49,14 @@ const $ = (name: string) => ({
   all: () => [{ json: name === 'Merge Session' ? mergedSession : {} }],
   item: { json: mergedSession },
 });
-const $env = { N8N_BASE_URL: 'https://example.app.n8n.cloud', TOKEN_ENCRYPTION_KEY: 'a'.repeat(64) };
+// ANTHROPIC_API_KEY comes from the environment, the way n8n reads it from a
+// Global variable. Without it `Optimize Cart` throws before it reaches MCP, and
+// the harness could never exercise the node it exists to exercise.
+const $env = {
+  N8N_BASE_URL: 'https://example.app.n8n.cloud',
+  TOKEN_ENCRYPTION_KEY: 'a'.repeat(64),
+  ANTHROPIC_API_KEY: process.env.ANTHROPIC_API_KEY ?? '',
+};
 const $input = { all: () => [{ json: mergedSession }], first: () => ({ json: mergedSession }) };
 
 console.log(`\nRunning Code node "${nodeName}" against the live MCP server\n`);

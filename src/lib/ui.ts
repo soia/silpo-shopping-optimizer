@@ -137,8 +137,13 @@ interface Replacement {
   quantity?: number;
   onPromotion?: boolean;
   verifySize?: boolean;
-  brand?: string;
-  aiReason?: string;
+  // Nullable, not merely optional: the plan JSON carries an explicit null when
+  // Silpo has no brand attribute for the product and when the model returned no
+  // reason, and this file has to render what the plan actually contains.
+  brand?: string | null;
+  aiReason?: string | null;
+  /** At or above the engine's confidence bar: ticked when the card is drawn. */
+  confident?: boolean;
 }
 
 interface PlanSummary {
@@ -146,13 +151,16 @@ interface PlanSummary {
   saving?: number;
   itemsAnalyzed?: number;
   bonusAvailable?: number;
+  cartDiscount?: number;
+  couponsAvailable?: number;
 }
 
 interface Plan {
   planId?: string;
   replacements?: Replacement[];
   summary: PlanSummary;
-  slotExpired?: boolean;
+  /** The mode this plan was judged in — stated on the card, per Task 4.3. */
+  mode?: string | null;
 }
 
 /* ------------------------------------------------------------ static copy */
@@ -245,6 +253,18 @@ export const UI = {
 
   planStale: '⏳ План застарів — ціни могли змінитися.\n\nЗапустіть /optimize ще раз.',
 
+  /**
+   * Apply, with every box unticked.
+   *
+   * It used to be nearly unreachable, because the card opened with everything
+   * ticked and a guest had to work to empty it. Since only confident lines
+   * arrive ticked it is an ordinary state — and the branch it fell into
+   * reported «кошик змінився», which is a plain untruth about somebody's cart.
+   */
+  nothingSelected:
+    '☐ <b>Жодної заміни не обрано</b>\n\n' +
+    'Кошик не змінювався. Увімкніть кнопками ті заміни, з якими згодні, і натисніть «Застосувати» ще раз.',
+
   cartMovedOn:
     '🔄 Кошик змінився з моменту аналізу — жодної із запропонованих позицій у ньому вже немає.\n\n' +
     'Запустіть /optimize ще раз.',
@@ -267,7 +287,7 @@ export const BUTTON = {
   cart: '🛒 Мій кошик',
   settings: '⚙️ Налаштування',
   brands: '🚫 Марки, які не пропонувати',
-  sizes: '📦 Різниця в фасуванні',
+  sizes: '⚖️ Режим оптимізації',
   brandAdd: '+ Додати марку',
   brandRemove: '✕',
   about: 'Як це працює',
@@ -359,7 +379,7 @@ export function buildSettingsCard(authorized: boolean, blockedCount: number, tol
     : BUTTON.brands;
 
   const keyboard: Keyboard = [[{ text: brandsRow, callback_data: 'brands:' }]];
-  keyboard.push([{ text: BUTTON.sizes + ' · ' + toleranceLabel(tolerance), callback_data: 'sizes:' }]);
+  keyboard.push([{ text: BUTTON.sizes + ' · ' + modeLabel(tolerance), callback_data: 'sizes:' }]);
   keyboard.push([{ text: BUTTON.about, callback_data: 'about:' }]);
   keyboard.push([
     authorized
@@ -373,7 +393,7 @@ export function buildSettingsCard(authorized: boolean, blockedCount: number, tol
       '⚙️ <b>Налаштування</b>\n\n' +
       '👤 Акаунт «Сільпо»: ' + (authorized ? 'підключено' : 'не підключено') + '\n' +
       '🚫 Марок у винятках: ' + blockedCount + '\n' +
-      '📦 Різниця в фасуванні: ' + toleranceLabel(tolerance),
+      '⚖️ Режим оптимізації: ' + modeLabel(tolerance),
     keyboard,
   };
 }
@@ -395,32 +415,60 @@ export function buildSettingsCard(authorized: boolean, blockedCount: number, tol
  * The percentages here are derived from the same table the engine enforces, so
  * the screen cannot drift from the behaviour.
  */
-export const TOLERANCE_OPTIONS: Array<{ key: string; label: string; hint: string }> = [
-  { key: 'strict', label: 'Строго', hint: 'тільки те саме фасування' },
-  { key: 'normal', label: 'Звичайно', hint: 'до чверті більше або менше' },
-  { key: 'loose', label: 'Вільно', hint: 'помітно інше фасування, якщо ціна за 100 г краща' },
+/**
+ * The three modes, described by what they do to a shopping basket rather than
+ * by the thresholds behind them.
+ *
+ * Each hint names a consequence a shopper can picture. «0,8–1,25» is the truth
+ * and means nothing to anybody standing in a kitchen; «та сама марка, той самий
+ * обʼєм» is the same rule said in the words of the thing being bought.
+ *
+ * The keys match `MODES` in the engine. The engine owns the numbers, this file
+ * owns the words, and neither is derivable from the other — so the keys are the
+ * contract between them.
+ */
+export const MODE_OPTIONS: Array<{ key: string; label: string; hint: string }> = [
+  { key: 'conservative', label: 'Обережний', hint: 'той самий обʼєм і, за можливості, та сама марка' },
+  { key: 'balanced', label: 'Збалансований', hint: 'інша марка того самого товару — типовий вибір' },
+  { key: 'max', label: 'Максимальна економія', hint: 'сміливіші заміни, якщо суть покупки зберігається' },
 ];
 
-export function toleranceLabel(tolerance?: string | null): string {
-  const found = TOLERANCE_OPTIONS.find((o) => o.key === (tolerance || 'normal'));
-  return found ? found.label.toLowerCase() : 'звичайно';
+/**
+ * Folds a stored value to a mode key.
+ *
+ * The three legacy names are pack-size presets from before modes existed, and
+ * they are still sitting in session rows. `resolveMode()` in the engine does
+ * the same fold; the set is closed at three values and will never grow, which
+ * is why two short copies are preferable to making this file depend on the
+ * engine — it is inlined into screen nodes that carry no engine at all.
+ */
+function modeKey(value?: string | null): string {
+  const key = String(value || '');
+  if (key === 'strict') return 'conservative';
+  if (key === 'loose') return 'max';
+  return MODE_OPTIONS.some((o) => o.key === key) ? key : 'balanced';
 }
 
-export function buildSizesCard(tolerance?: string | null, notice?: string): Card {
-  const active = tolerance || 'normal';
+export function modeLabel(mode?: string | null): string {
+  const found = MODE_OPTIONS.find((o) => o.key === modeKey(mode));
+  return found ? found.label.toLowerCase() : 'збалансований';
+}
+
+export function buildModeCard(mode?: string | null, notice?: string): Card {
+  const active = modeKey(mode);
 
   let text =
-    '📦 <b>Різниця в фасуванні</b>\n\n' +
-    'Наскільки заміна може відрізнятися за обсягом або вагою від того, що у вашому кошику.\n\n';
-  text += TOLERANCE_OPTIONS.map(
+    '⚖️ <b>Режим оптимізації</b>\n\n' +
+    'Наскільки сміливо шукати заміни: від «майже те саме» до «дешевше, але суть покупки та сама».\n\n';
+  text += MODE_OPTIONS.map(
     (o) => (o.key === active ? '● ' : '○ ') + b(o.label) + ' — ' + o.hint,
   ).join('\n');
   text +=
     '\n\n' +
-    i('Менша упаковка за меншу ціну — це не економія, тому за будь-якого налаштування я порівнюю ціну за однакову кількість.');
+    i('У будь-якому режимі я порівнюю ціну за однакову кількість: менша упаковка за меншу ціну — це не економія.');
   if (notice) text += '\n\n' + i(notice);
 
-  const keyboard: Keyboard = TOLERANCE_OPTIONS.map((o) => [
+  const keyboard: Keyboard = MODE_OPTIONS.map((o) => [
     { text: (o.key === active ? '● ' : '○ ') + o.label, callback_data: 'sizes:' + o.key },
   ]);
   keyboard.push([{ text: BUTTON.back, callback_data: 'settings:' }]);
@@ -478,6 +526,73 @@ export function brandToast(kind: 'added' | 'removed' | 'duplicate', brand: strin
   return brand + ' вже у списку';
 }
 
+/**
+ * Where the money is, and where it is not.
+ *
+ * The temptation this block exists to resist is adding four numbers together.
+ * Only the first line is money this run produces; the other three are money the
+ * guest already has or could get somewhere else, and summing them would inflate
+ * the headline by several hundred hryvnia of other people's work:
+ *
+ *   - **Акції** are already inside the cart price. Silpo puts the regular price
+ *     in `oldPrice` and the promotional one in `price`, so `total` is the
+ *     discounted figure and `calculation.subDiscount` is what it already saved.
+ *     Counting it again would be counting it twice.
+ *   - **Купони** are a count, never a sum: `get_my_coupons` says nothing about
+ *     which of them apply to this cart or what they are worth.
+ *   - **Балабонуси** are only real once a checkout confirms them.
+ *
+ * So each line says what it is, and the totals stay apart. Lines with nothing
+ * behind them are omitted rather than printed as zero.
+ */
+function statsLines(summary: PlanSummary, replacements: number, mode?: string | null): string[] {
+  const lines = [
+    '🔍 Перевірено ' + (summary.itemsAnalyzed || 0) + ' ' +
+      plural(summary.itemsAnalyzed || 0, 'товар', 'товари', 'товарів') +
+      ' · ' + replacements + ' ' + plural(replacements, 'заміна', 'заміни', 'замін'),
+    // The mode explains the result: an empty card in «Обережний» means
+    // something different from an empty card in «Максимальна економія», and
+    // without the label the guest cannot tell which they are looking at.
+    '⚖️ Режим · ' + modeLabel(mode),
+  ];
+  if (summary.cartDiscount && summary.cartDiscount > 0) {
+    lines.push('🎁 Акції вже в ціні кошика · ' + money(summary.cartDiscount));
+  }
+  if (summary.couponsAvailable && summary.couponsAvailable > 0) {
+    lines.push(
+      '🎫 У вас ' + summary.couponsAvailable + ' ' +
+        plural(summary.couponsAvailable, 'купон', 'купони', 'купонів') +
+        ' — застосуйте при оформленні',
+    );
+  }
+  if (summary.bonusAvailable && summary.bonusAvailable > 0) {
+    lines.push('💳 Балабонуси · ' + money(summary.bonusAvailable) + ' — застосуйте при оформленні');
+  }
+  return lines;
+}
+
+/**
+ * Which replacements are ticked when the card is first drawn.
+ *
+ * Not everything, which is what it used to be. A run mixes swaps the engine is
+ * sure of with swaps it merely finds plausible, and ticking both by default
+ * meant a guest who trusted the bot and pressed Apply got the plausible ones
+ * too — the card said "confidence 0.55" nowhere a person would read it.
+ *
+ * Now the sure ones arrive ticked and the rest arrive visible, explained and
+ * off. Nothing is hidden; only the default changes, and the default is the one
+ * thing most guests will accept unread.
+ *
+ * A run where nothing clears the bar therefore opens with nothing ticked, and
+ * the card headlines the saving as *possible* rather than promised. Ticking the
+ * best line anyway was written first and thrown away: it would have put an
+ * unconfident swap behind the one tap most guests make without reading, which
+ * is the exact behaviour this change exists to end.
+ */
+export function defaultSelection(replacements: Replacement[]): number[] {
+  return replacements.map((r, i) => i).filter((i) => replacements[i].confident);
+}
+
 /* -------------------------------------------------------------- cart view */
 
 interface CartLine {
@@ -508,8 +623,15 @@ interface CartLine {
 export function buildCartCard(
   lines: CartLine[],
   total: number,
-  extras: { discount?: number; bonusAvailable?: number; slotBroken?: boolean } = {},
+  extras: { discount?: number; bonusAvailable?: number } = {},
 ): Card {
+  // Thirty items was the only limit here, and it was the wrong kind of limit.
+  // Thirty rows of the longest names Silpo writes — «Оселедець Norsk
+  // Delikatesse норвезький молодий слабосолоний, філе в упаковці», kept
+  // unclipped because four of them collide — comes to 4239 characters, and
+  // Telegram refuses anything over 4096 outright. The guest would have seen no
+  // cart at all rather than a shortened one. A character budget below does the
+  // real work; this cap only stops the loop early on an enormous basket.
   const LIMIT = 30;
   const shown = lines.slice(0, LIMIT);
 
@@ -521,34 +643,64 @@ export function buildCartCard(
 
   const names = clipAll(shown.map((item) => item.name), 38);
 
-  text += shown
-    .map((item, index) => {
-      // Price first and bold, old price struck out right after it: the two
-      // numbers explain each other, so neither needs a label.
-      const meta = [b(money(item.price))];
-      if (item.oldPrice && item.oldPrice > item.price) meta.push(s(money(item.oldPrice)));
-      const tail = [];
-      if (item.quantity && item.quantity > 1) tail.push('× ' + item.quantity);
-      if (item.ratio) tail.push(esc(item.ratio));
-      return (
-        (index + 1) + '. ' + names[index] + '\n     ' +
-        meta.join(' ') + (tail.length ? ' · ' + tail.join(' · ') : '')
-      );
-    })
-    .join('\n');
+  const items = shown.map((item, index) => {
+    // Price first and bold, old price struck out right after it: the two
+    // numbers explain each other, so neither needs a label.
+    const meta = [b(money(item.price))];
+    if (item.oldPrice && item.oldPrice > item.price) meta.push(s(money(item.oldPrice)));
+    const tail = [];
+    if (item.quantity && item.quantity > 1) tail.push('× ' + item.quantity);
+    if (item.ratio) tail.push(esc(item.ratio));
+    return (
+      (index + 1) + '. ' + names[index] + '\n     ' +
+      meta.join(' ') + (tail.length ? ' · ' + tail.join(' · ') : '')
+    );
+  });
 
-  if (lines.length > shown.length) {
-    text += '\n\n<i>…і ще ' + (lines.length - shown.length) + ' ' + plural(lines.length - shown.length, 'позиція', 'позиції', 'позицій') + '.</i>';
-  }
-
+  // The tail is built first so the budget knows what it has to leave room for.
+  // Discounts, bonuses and the checkout-blocking slot warning are the part a
+  // guest must not lose to a long list of things they already know they bought.
   const notes: string[] = [];
   if (extras.discount && extras.discount > 0) notes.push('🎁 Знижок уже враховано · <b>' + money(extras.discount) + '</b>');
   if (extras.bonusAvailable && extras.bonusAvailable > 0) notes.push('💳 Балабонуси · ' + money(extras.bonusAvailable));
-  if (notes.length) text += '\n' + RULE + '\n' + notes.join('\n');
 
-  if (extras.slotBroken) {
-    text += '\n\n⏰ <i>Слот доставки протух — оберіть новий у застосунку, інакше кошик не оформиться.</i>';
+  // There used to be a third line here: «⏰ Слот доставки протух — оберіть новий
+  // у застосунку, інакше кошик не оформиться». It is gone, and the reason is
+  // not that it was untrue.
+  //
+  // The test for it is `timeslotStart < now`, which is satisfied for everybody
+  // who filled a basket yesterday — and an expired slot is not a broken state,
+  // it is an unfinished checkout. Picking a slot *is* part of checking out, and
+  // the Silpo app asks for one at the till. So the bot was telling almost every
+  // guest, almost every time, that they had not finished ordering yet, which
+  // they knew. A warning that is nearly always true stops being a warning and
+  // becomes the thing the eye learns to skip — taking the discount and bonus
+  // lines above it along.
+  //
+  // The run itself is unaffected: `Optimize Cart` fetches a fresh slot before
+  // it asks Silpo anything, precisely so a stale one cannot skew availability.
+  const tail = notes.length ? '\n' + RULE + '\n' + notes.join('\n') : '';
+
+  // A blank line between items, the same as on the selection card and for the
+  // same reason. Ten two-line blocks stacked without a gap read as twenty lines
+  // of alternating name and price, and the eye has to use the leading digit to
+  // find where each item starts. The gap does the grouping instead, and it is
+  // what makes a price sit under its own name rather than float between two.
+  const BUDGET = 3900;
+  let kept = 0;
+  for (const item of items) {
+    const next = (kept ? '\n\n' : '') + item;
+    // 90 characters held back for the «…і ще N позицій» line this may need.
+    if (text.length + next.length + tail.length + 90 > BUDGET) break;
+    text += next;
+    kept++;
   }
+
+  const hidden = lines.length - kept;
+  if (hidden > 0) {
+    text += '\n\n<i>…і ще ' + hidden + ' ' + plural(hidden, 'позиція', 'позиції', 'позицій') + '.</i>';
+  }
+  text += tail;
 
   return { text, keyboard: [[{ text: BUTTON.optimize, callback_data: 'optimize:' }]] };
 }
@@ -581,13 +733,12 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
       ' · <b>' +
       money(originalTotal) +
       '</b>\n\n' +
-      'Дешевших аналогів, які зберігають суть покупки, не знайшов.';
-    if (plan.slotExpired) {
-      text += '\n\n<i>Слот доставки протух, тож наявність могла зчитатися неточно. Оберіть новий слот у застосунку і спробуйте ще раз.</i>';
-    }
-    if (plan.summary.bonusAvailable && plan.summary.bonusAvailable > 0) {
-      text += '\n\n💳 Балабонуси · ' + money(plan.summary.bonusAvailable) + ' — застосуйте при оформленні.';
-    }
+      'Дешевших аналогів, які зберігають суть покупки, не знайшов.\n\n' +
+      RULE + '\n' + statsLines(plan.summary, 0, plan.mode).join('\n');
+    // The stale-slot caveat is gone from here too, for the same reason: the run
+    // used a fresh slot, so "availability may have been misread" was not what
+    // happened. An empty result means no candidate survived the gate and the
+    // model — saying otherwise sent the guest to fix something unrelated.
     return { text, keyboard: [] };
   }
 
@@ -595,11 +746,19 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   const saving = chosen.reduce((sum, r) => sum + r.saving, 0);
   const share = percent(saving, originalTotal);
 
-  let text =
-    '💰 <b>Заощадите ' + money(saving) + '</b>\n' +
-    'Кошик ' + money(originalTotal) + ' → ' + b(money(originalTotal - saving)) +
-    (share ? ' · −' + share : '') + '\n' +
-    RULE + '\n';
+  // Nothing ticked means nothing cleared the confidence bar. The headline then
+  // states what is on offer instead of a promise of zero, and the total below
+  // it is the cart as it stands — because that is what it would stay.
+  const possible = replacements.reduce((sum, r) => sum + r.saving, 0);
+
+  let text = !chosen.length
+    ? '💰 <b>Можлива економія ' + money(possible) + '</b>\n' +
+      'Жодну заміну не ввімкнено — увімкніть ті, з якими згодні.\n' +
+      RULE + '\n'
+    : '💰 <b>Заощадите ' + money(saving) + '</b>\n' +
+      'Кошик ' + money(originalTotal) + ' → ' + b(money(originalTotal - saving)) +
+      (share ? ' · −' + share : '') + '\n' +
+      RULE + '\n';
 
   // Both names are clipped against one list, originals and replacements
   // together: a replacement is usually the same product from another brand, so
@@ -610,7 +769,12 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
     34,
   );
 
-  replacements.forEach((r, index) => {
+  // Each replacement is built twice — with its reason and without — because the
+  // reason is the first thing to give up when the message runs out of room.
+  // Telegram rejects anything over 4096 characters outright, and a cart with
+  // fifteen replacements reaches that: the card had no budget at all before, so
+  // a large basket would simply have failed to send.
+  const blocks = replacements.map((r, index) => {
     const on = selected.indexOf(index) !== -1;
 
     // The old line was «33,99 ₴ → 19,99 ₴ · −14,00 ₴ · 🎁 акція»: the third
@@ -619,27 +783,101 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
     // the old the way a price tag does, and the only bare number left is the
     // saving — which says «економія» beside it.
     const priceLine = s(money(r.originalPrice)) + ' → ' + b(money(r.replacementPrice));
+    // Facts about the product, and nothing else.
+    //
+    // A per-row marker for the cautious lines lived here through two wordings —
+    // «менш впевнено», then «не певен» — and both failed for the same reason,
+    // which was never the wording. It was a report on the bot's own state,
+    // parked in a list of things that are true about the goods, so it read as a
+    // third product attribute beside the saving and the promotion.
+    //
+    // Nothing was lost by deleting it. The empty ☐ already says the line is off;
+    // the 💬 line under it already says what the doubt is about, in terms of the
+    // product («зовсім інший смак»), which is what a person can actually act on.
+    // What the marker was really carrying — *why* some boxes start empty —
+    // belongs once under the list, with the rest of the instructions.
     const facts = ['💰 економія ' + money(r.saving)];
     if (r.onPromotion) facts.push('за акцією');
-    if (r.brand) facts.push('марка ' + esc(r.brand));
 
-    text +=
+    const head =
       (on ? ON : OFF) + ' ' + b(index + 1 + '.') + ' ' + clipped[index] + '\n' +
       '      ➜ ' + clipped[replacements.length + index] + '\n' +
       '      ' + priceLine + '\n' +
       '      ' + facts.join(' · ') + '\n';
+
+    // The reason answers the question the guest actually has in front of a
+    // swap — why is this the same purchase — and it is the model's own words
+    // about this pair, not a template. The brand moved to «Деталі» to make room:
+    // it matters when blocking a brand, not when deciding one swap.
+    return { head, reason: r.aiReason ? '      💬 ' + i(esc(r.aiReason)) + '\n' : '' };
   });
+
+  // The legend appears only when it has something to explain. On a card where
+  // every line is ticked it would be answering a question nobody asked, and
+  // each glyph needs its own line — two emoji on one line is the point where a
+  // screen starts looking like a toy.
+  const legend = replacements.some((r) => !r.confident)
+    ? '✅ — впевнений, що це та сама покупка\n' +
+      '☐ — тут вирішувати вам: подивіться, що я написав під ціною\n'
+    : '';
+
+  const footer =
+    RULE + '\n' +
+    statsLines(plan.summary, replacements.length, plan.mode).join('\n') + '\n' +
+    RULE + '\n' +
+    'ℹ️ Кнопки під повідомленням вмикають і вимикають заміни.\n' +
+    legend +
+    'Натисніть ' + b('«Застосувати»') + ', коли позначите потрібне.\n';
+
+  // A blank line between items, and it is not decoration.
+  //
+  // Four indented lines under a heading is a block; two such blocks with
+  // nothing between them is eight lines of near-identical shape, and the only
+  // thing marking where one product ends and the next begins is the ✅ or ☐ at
+  // the far left. The eye has to go back to the margin and count. One empty
+  // line does what a paragraph break does anywhere else, and it costs one
+  // character per item against a budget that gives up reasons first.
+  const GAP = '\n';
+
+  // 3600 rather than 4096: the notes, the bonus line and the slot caveat are
+  // still to come, and they are the part a guest must not lose.
+  const LIMIT = 3600;
+  const withReasons = blocks.reduce(
+    (sum, blk) => sum + blk.head.length + blk.reason.length + GAP.length,
+    0,
+  );
+  const withReason = text.length + withReasons + footer.length <= LIMIT;
+
+  let shown = 0;
+  for (const block of blocks) {
+    const next = block.head + (withReason ? block.reason : '') + GAP;
+    if (text.length + next.length + footer.length > LIMIT) break;
+    text += next;
+    shown++;
+  }
+  if (shown < blocks.length) {
+    text += '<i>…і ще ' + (blocks.length - shown) + ' ' +
+      plural(blocks.length - shown, 'заміна', 'заміни', 'замін') + ' — у «Деталях».</i>\n';
+  }
 
   // «Торкніться позначки» named nothing the guest can see: the ✅ in the text is
   // not tappable, the buttons under the message are. Say which, and say what
   // happens after — the instruction is useless without the step it leads to.
-  text +=
-    RULE + '\n' +
-    'ℹ️ Кнопки під повідомленням вмикають і вимикають заміни.\n' +
-    'Залиште ✅ на тих, які застосувати, і натисніть ' + b('«Застосувати»') + '.\n';
+  text += footer;
 
-  // Each caveat is its own paragraph. Run together they read as one long
-  // disclaimer and get skipped as a block.
+  // No caveats left here, and the one that used to be is worth recording.
+  //
+  // «⏰ Слот доставки протух — наявність може відрізнятися» rode on every result
+  // whose cart had a stale slot, and it was close to untrue. The analysis does
+  // not run against the stale slot: `Optimize Cart` fetches a fresh one from
+  // `get_time_slots` and asks every question against that, precisely so
+  // availability is read correctly. The warning described a problem the
+  // pipeline had already worked around, on a screen where the guest could do
+  // nothing about it.
+  //
+  // Where it belongs is the cart screen, which says the actionable thing
+  // instead — «оберіть новий у застосунку, інакше кошик не оформиться». A slot
+  // is a checkout problem, not an optimization problem.
   const notes: string[] = [];
   // There used to be an unconditional note here explaining that Silpo does not
   // expose pack size in search, so it could only be checked from the cart. That
@@ -648,13 +886,10 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   // replacement is ever proposed. A caveat that no longer applies is worse than
   // none — the rare line that genuinely could not be compared says so on its own
   // row instead.
-  if (plan.slotExpired) {
-    notes.push('⏰ <i>Слот доставки протух — наявність може відрізнятися.</i>');
-  }
-  if (plan.summary.bonusAvailable && plan.summary.bonusAvailable > 0) {
-    notes.push('💳 <i>Балабонуси · ' + money(plan.summary.bonusAvailable) + ' — застосуйте при оформленні.</i>');
-  }
-  text += '\n' + notes.join('\n\n');
+  // The bonus line moved into the stats block above, beside the other money the
+  // guest has but this run did not produce. It used to sit here on its own,
+  // where it read as part of the saving rather than as something separate.
+  if (notes.length) text += '\n' + notes.join('\n\n');
 
   const keyboard: Keyboard = replacements.map((r, i) => [
     {
@@ -705,6 +940,11 @@ export function buildDetailsCard(plan: Plan, planId: string): Card {
     ];
     if (r.brand) lines.push('      🏷 марка ' + esc(r.brand));
     if (r.aiReason) lines.push('      💬 <i>' + esc(r.aiReason) + '</i>');
+    // The card says this in three words; here there is room to say what the
+    // guest is actually being asked to do about it.
+    // Here there is room to say it as a sentence, and the sentence is about the
+    // guest's decision rather than about the bot's certainty.
+    if (!r.confident) lines.push('      ⚖️ <i>не позначив — вирішіть самі, чи це та сама покупка</i>');
     // Rare now: fires when the two pack sizes are not comparable at all — a
     // count against a volume ("30шт" vs "1,5л") — not because the data is missing.
     if (r.verifySize) lines.push('      📦 <i>фасування не звірити — перевірю в кошику</i>');

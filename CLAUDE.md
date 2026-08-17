@@ -69,6 +69,64 @@ What remains true from the all-model era:
   and is written after the cart has already changed, so a static line is less
   personal, not wrong.
 
+## 3b. Two prices are only comparable on the same basis
+
+A weighted line's `price` is **per kilogram**. A packaged product's is **for one
+pack of `displayRatio`**. Both may print «100г», and nothing but the `weighted`
+flag distinguishes them.
+
+Subtracting one from the other reported a 6% saving as **−90.61%**, and it was
+72.40 of a 103.00 UAH headline. It would also have added *0.1 of a pack* to the
+cart, because the apply step reuses the original line's quantity.
+
+- Never compare `price` across a `weighted` boundary — reject instead.
+- `unitPrice()` is the only honest comparison, and it reads the basis from
+  `weighted` before it divides by anything.
+- `sizeOf()` / `parseSize()` on a weighted line parse a **shelf label**, not a
+  pack. Do not divide by it.
+
+## 3c. The gate decides facts; the model decides meaning
+
+`rejectReason()` runs before the prompt and again on the confirmed price. It may
+only encode things the API states outright: availability, stock, price basis,
+pack ratio, unit price, the fat percentage in a name, the saving floor.
+
+It must never grow a rule about what a product is *for*. Kombucha against juice,
+protein against dessert, children's food against ordinary — those stay the
+model's, and a category rule engine for them would be brittle and wrong. The
+gate's job is to hand the model a shorter, honest pool.
+
+Any rule added there needs its share of rejections measured. A rule that never
+fires on real data is dead code and must be said so (working rule 9).
+
+## 3d. Confidence has to change what happens
+
+A number the guest never feels is decoration. The bands are:
+
+```
+>= confidentAt(mode)    offered and ticked
+>= minConfidence(mode)  offered, explained, NOT ticked
+<  minConfidence(mode)  not offered
+```
+
+Measure before moving them. The brief's 0.85/0.65 were tried against a live run
+whose four answers came back at 0.55–0.70 — an 0.85 floor would have emptied
+every card. The thresholds live in `MODES` and nowhere else.
+
+The tick bar does not drop in a bolder mode. Bolder means *shown* more, never
+*applied* more on behalf of somebody who is not reading.
+
+## 3e. Never add a saving the guest already has
+
+Cart lines arrive with promotions applied: `price` is the promotional price,
+`oldPrice` the regular one, and `calculation.subDiscount` is what Silpo has
+already taken off. State it, never sum it — on the measured cart that would have
+inflated the headline seventeenfold.
+
+Coupons are shown as a **count**, never a value: `get_my_coupons` proves neither
+applicability nor amount. Bonuses stay out of the saving; only a checkout
+confirms them.
+
 ## 4. Code inside template literals is two layers deep
 
 Node code lives in TypeScript template literals in `src/workflow/build.ts`, so
@@ -99,8 +157,18 @@ and keyboard) are transpiled and inlined into the n8n Code nodes by
 
 - **Never hand-edit `workflows/*.json`.** It is generated output.
 - Change logic in `src/lib/`, then `npm run build:workflows`.
-- Finish with `npm run check` (typecheck → build → validate → screens) before
-  calling anything done.
+- Finish with `npm run check` (typecheck → test → build → validate → screens)
+  before calling anything done.
+
+`npm test` is `node:test` against `src/lib/engine.test.ts` — no framework, no
+dependency. It pins the two things that are code rather than judgement: the
+gate and the arithmetic. Selection is the model's and is not reproducible, so
+nothing there is asserted.
+
+`npm run optimize -- --dump` writes the cart and every candidate pool to
+`.secrets/fixture.json` and stops before the model. Use it instead of paying for
+a live run to answer a question about the data — the price-basis defect was
+found in a fixture, not in a bill.
 
 The engine reaches the network through an injectable fetcher. The Code-node
 sandbox has no global `fetch`, so `Optimize Cart` calls `setFetcher(httpFetch)`

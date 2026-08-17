@@ -503,3 +503,181 @@ Band verification on a 17-replacement plan at `normal`: 17 of 17 pairs
 comparable, all within 0.80-1.20, none out of band, `verifySize` flagged zero
 times. Presets rather than a typed number: a free-form value needs parsing,
 validation and an error path, and "0.8" means nothing to a shopper.
+
+---
+
+## 2026-08-17 — the hard gate, and a saving that was not there
+
+The engine had no deterministic stage at all: every candidate `similar_products`
+returned went to the model, filtered only by "cheaper, in stock, not the same
+product". Measured on a live 19-line cart (1970.96 UAH), that produced four
+replacements worth **103.00 UAH**, and the number was wrong.
+
+### Two price bases, compared as if they were one
+
+```
+Балик «Ювілейний»       weighted=true    ratio "100г"   price 799.00
+  → Полядвиця Глобино   weighted=false   displayRatio "100г"   price 74.99
+     reported: saving 72.40 UAH (−90.61%)
+```
+
+Both rows say «100г». Nothing else in either payload says they are quoted
+differently — and they are. A weighted line's `price` is **per kilogram**; a
+packaged one's is **for one pack**. So the real comparison is 799.00 per kg
+against 749.90 per kg: about 6%, not 90%.
+
+The derivation is from the fixture rather than from documentation, which says
+nothing about it. In the «Шинка Daniel» pool the weighted hams price at
+299–649 while the packaged ones sit at 95.99 per 170 g, i.e. 565 per kg.
+Weighted prices only land in that range read as per-kilogram; read as per-100 g
+the same ham would be 5 490 per kg, ten times its own shelf neighbours.
+
+**72.40 of the 103.00 UAH headline was this one swap.** Of the rest, 0.60 UAH
+was a sausage flavour change and 25.00 UAH was sliced ham offered a pork knuckle.
+
+The same defect reached further than the number. `Apply Changes` adds a
+replacement with the original line's quantity, so a weighted 0.1 kg line would
+have added **0.1 of a pack** of the packaged substitute.
+
+### What the gate rejects, and what it refuses to decide
+
+`rejectReason()` runs before the prompt and again on the confirmed price after
+`get_product_details`. Every rule is a fact the API states:
+
+| rule | why it is safe to decide in code |
+|---|---|
+| same product | `similar_products` returns the original in every pool |
+| unavailable / not enough stock | stated per candidate |
+| **price basis differs** | `weighted` differs, so no saving can be derived |
+| not cheaper | a replacement that does not save is not one |
+| saving below 2.00 UAH | measured: a 0.60 UAH swap changed a sausage flavour |
+| different grade | fat percentage in the name, differing by over 1 point |
+| pack size out of band | both sizes parse, the ratio is outside the mode's band |
+| worse per unit | a smaller pack at a lower ticket price is not a saving |
+
+Nothing about what a product is *for* is decided here. Whether kombucha may
+become juice stays the model's judgement, because a rule engine for that would
+be brittle and wrong. What the model gets instead is a shorter pool and, for the
+first time, prices it can actually compare: the prompt now carries the price per
+100 g or per litre, computed in code, and marks a weighted line as such.
+
+### Measured on the same cart, before and after
+
+```
+                    before      after
+saving              103.00      20.00 UAH
+replacements             4          2
+of which defensible      1          2
+candidates rejected      —        468
+model calls             11          6
+run time              19.9 s     12.7 s
+```
+
+The drop is the correction. Both survivors came back at `confidence 0.65`, so
+the card opens with **nothing ticked** and headlines «Можлива економія 20,00 ₴».
+
+Rejection tally over 468 candidates: 252 not cheaper, 148 price basis differs,
+39 pack size out of band, 19 same product, 6 below the saving floor, 4 stock.
+
+**Two rules did not fire on this basket**: `worse per unit` and
+`different grade`. This cart is cured meat and spirits — no fat percentages in
+the names, few multi-size families. They are covered by `npm test` rather than
+by live evidence, and that distinction is the honest one to record.
+
+### Confidence, measured before it was used
+
+The brief proposed 0.85 and 0.65. Measured first: the four replacements of the
+baseline run came back at 0.55, 0.60, 0.60 and 0.70, and **nothing in that run
+reached 0.80**. An 0.85 floor would have emptied every card while proving
+nothing about quality.
+
+So the bands are set where this model's answers fall, and they do different
+things rather than the same thing at different strengths:
+
+```
+>= confidentAt   offered and ticked
+>= minConfidence offered, explained, and NOT ticked
+<  minConfidence not offered at all
+```
+
+Presenting the middle band unticked is the change. Before it, a 0.55 swap and a
+0.95 swap arrived as two identical rows, both ticked, and Apply took both.
+
+### One control, not three
+
+The pack-size presets became modes, because pack size turned out to be one face
+of a single question — how far a replacement may travel from the original.
+
+| mode | pack size | offered from | ticked from | brand |
+|---|---|---|---|---|
+| `conservative` | 0.95–1.05 | 0.75 | 0.85 | prefers the same |
+| `balanced` | 0.8–1.25 | 0.60 | 0.80 | free |
+| `max` | 0.6–1.7 | 0.55 | 0.80 | free, and said so |
+
+The tick bar deliberately does **not** move outside `conservative`: a guest
+asking for bigger savings is asking to be shown more, not to have more applied
+while they are not reading. `MIN_SAVING` does not move either.
+
+The three old preset names still sit in `silpo_sessions.size_tolerance`, and
+`resolveMode()` folds them onto the mode carrying the same band. Nothing was
+migrated and no table changed.
+
+### Promotions, coupons, bonuses — what the data actually supports
+
+Cart lines carry the promotion **already applied**:
+
+```
+Віскі William Lawson's   price 349.00   oldPrice 599.00
+                         subTotal 599.00   subDiscount 250.00   total 349.00
+```
+
+`total = price × quantity` and `subTotal = oldPrice × quantity`, so
+`calculation.subDiscount` is money the guest already has. It is stated beside
+the saving — «🎁 Акції вже в ціні кошика · 344,51 ₴» — and never added to it.
+Adding it would have inflated this cart's headline seventeenfold.
+
+Coupons and personal promos could not be verified at all:
+
+```
+silpo_get_my_coupons  → { "coupons": [] }
+silpo_get_promo_codes → { "promoCodes": [] }
+silpo_get_my_promos   → { "promos": [] }
+```
+
+Empty on this account, so applicability cannot be proven and value cannot be
+computed. The card therefore shows a **count**, never a sum, and says to apply
+them at checkout. Applying one needs `update_shopping_cart`, which requires the
+whole cart state mirrored back — a write, and out of scope by decision.
+
+Loyalty bonuses are shown the same way and stay out of the saving: only a
+checkout response can confirm them.
+
+### Quantity promotions exist in the data, and are not modelled
+
+`specialPrices` is real and structured, not free text:
+
+```
+Шинка Argal    specialPrices: [{ "price": 47.90, "count": 0.3, "type": "from" }]
+Кабаноси       specialPrices: [{ "price": 119.00, "count": 2,  "type": "from" }]
+```
+
+Present on **4 of 73** candidates in the fixture, and absent from cart lines
+altogether. So the data exists for "buy 2 at 119 each" but the cart side of the
+comparison does not, and acting on it would change what the guest buys. Left
+unmodelled and recorded here rather than approximated.
+
+### A card that would not have sent
+
+Adding the reason line to the selection card exposed that it had **no length
+budget at all**. Telegram rejects anything over 4096 characters outright, so a
+basket with fifteen replacements would have produced no message whatsoever.
+The card now drops reasons first, then trims the list with «…і ще N замін», and
+`npm test` holds a 40-replacement plan against the cap.
+
+### Unticking everything used to lie
+
+With every line ticked by default, Apply-with-nothing-selected was hard to
+reach. It is now the ordinary opening state of a cautious run — and it fell
+through to «Кошик змінився з моменту аналізу», which was untrue about a cart
+nothing had touched. It is rejected in `Validate Plan` instead, **before**
+`Claim Plan`, so the plan stays `pending` and a mistap costs nothing.

@@ -790,10 +790,11 @@ return routed.map(r => {
   const blockedBrands = row && row.blocked_brands
     ? String(row.blocked_brands).split('|').map(b => b.trim()).filter(Boolean)
     : [];
-  // Unknown or absent falls back to 'normal' - never to the widest band.
-  const allowed = ['strict', 'normal', 'loose'];
-  const raw = row && row.size_tolerance ? String(row.size_tolerance) : '';
-  const sizeTolerance = allowed.indexOf(raw) !== -1 ? raw : 'normal';
+  // The column still holds the pack-size preset for guests who set one before
+  // modes existed; the engine and the screens both fold those three names onto
+  // the mode carrying the same band, so nothing has to be migrated. Anything
+  // unrecognised degrades to the default, never to the boldest setting.
+  const sizeTolerance = row && row.size_tolerance ? String(row.size_tolerance) : '';
   return { json: { ...r, authorized: Boolean(session), session, blockedBrands, sizeTolerance } };
 });
 `,
@@ -1128,21 +1129,22 @@ const blockedBrands = (input.blockedBrands || []).filter(Boolean);
 // Cheap pre-filter on the name; the authoritative check is on the attribute.
 const isBlockedName = name => blockedBrands.some(b => normalizeBrand(name).indexOf(normalizeBrand(b)) !== -1);
 
-// Phase 1 - the model chooses, one call per line.
+// Phase 1 - the deterministic gate, then the model, one call per line.
+//
+// filterCandidates removes only what the API states as fact: a price quoted on
+// another basis (weighted against packaged), a pack outside the guest's band, a
+// grade that differs, a candidate that is worse per unit despite a lower ticket
+// price. What a product is *for* stays the model's judgement - the gate makes
+// its pool shorter and honest, it does not make its decision.
+const band = sizeBand(input.sizeTolerance);
+const gateTally = {};
 const pools = items.map((item, i) => {
   const candidates = lookups[i] && lookups[i].ok ? lookups[i].value : [];
-  // similar_products returns the original product itself as a candidate.
-  //
-  // Candidates priced at or above the original are dropped before the prompt is
-  // built. Not a judgement the model should make: a replacement must save money
-  // to be one, so those rows cannot become an answer - they only make the
-  // prompt longer and the call slower, which is what blew the 60 s timeout.
-  return candidates.filter(c =>
-    c.id !== item.productId
-    && c.available
-    && (c.stock || 0) >= item.quantity
-    && c.price < item.price
-    && !isBlockedName(c.name));
+  const result = filterCandidates(item, candidates.filter(c => !isBlockedName(c.name)), band);
+  for (const reason of Object.keys(result.rejected)) {
+    gateTally[reason] = (gateTally[reason] || 0) + result.rejected[reason];
+  }
+  return result.kept;
 });
 
 const picks = await mapLimit(items, MODEL_CONCURRENCY, async (item, i) => {
@@ -1160,9 +1162,14 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
   const selection = picks[i] && picks[i].ok ? picks[i].value : null;
   if (!selection || selection.chosen == null) return null;
 
-  const order = [selection.chosen].concat(selection.alternates || []);
+  // Each option carries the verdict the model wrote about it. A runner-up is a
+  // product in its own right, not a consolation prize, and the guest will be
+  // looking at it in their cart.
+  const order = [{ index: selection.chosen, reason: selection.reason, confidence: selection.confidence }]
+    .concat(selection.alternates || []);
   const confirmed = [];
-  for (const idx of order) {
+  for (const option of order) {
+    const idx = option.index;
     if (confirmed.length >= MAX_OPTIONS) break;
     const candidate = pools[i][idx];
     if (!candidate) continue;
@@ -1190,6 +1197,11 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
       available: true,
       brand,
     });
+    // The gate again, on the confirmed price. get_product_details overrides the
+    // search price, and a candidate that only cleared the floor at its stale
+    // price must not slip through on the strength of the model having liked it.
+    if (rejectReason(item, confirmedCandidate, band)) continue;
+
     // Computed here, from the price details just confirmed - not from the search
     // result and not by the model.
     const numbers = computeSaving(item, confirmedCandidate);
@@ -1197,19 +1209,22 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
       candidate: confirmedCandidate,
       saving: numbers.saving,
       savingPct: numbers.savingPct,
-      isTopPick: idx === selection.chosen,
+      reason: option.reason,
+      confidence: option.confidence,
     });
   }
   if (!confirmed.length) return null;
 
-  // The model's own numbers travel with whichever candidate is actually used,
-  // so a promoted runner-up never inherits the top pick's saving.
+  // The model's own verdict travels with whichever candidate is actually used,
+  // so a promoted runner-up inherits neither the top pick's saving nor its
+  // words. It used to inherit a placeholder instead - «Запасний варіант,
+  // основний виявився недоступним» - plus a confidence floored at 0.6, which
+  // left a perfectly good kefir unticked and unexplained. Both were code
+  // inventing a judgement; now the model makes it, per option, in the one call.
   const best = confirmed[0];
   const enrichedSelection = Object.assign({}, selection, {
-    // Confidence and reason describe the top pick only; a promoted runner-up
-    // says so plainly rather than borrowing words written about another product.
-    reason: best.isTopPick ? selection.reason : 'Запасний варіант — основний виявився недоступним',
-    confidence: best.isTopPick ? selection.confidence : Math.min(selection.confidence, 0.6),
+    reason: best.reason,
+    confidence: best.confidence,
   });
   best.candidate.alternates = confirmed.slice(1).map(o => ({
     productId: o.candidate.id,
@@ -1228,7 +1243,15 @@ const selected = items.map((item, i) => {
   return { item, candidate: r ? r.candidate : null, selection: r ? r.selection : null };
 });
 
-const plan = buildPlan(items, selected, cartResponse.loyalty || {});
+// subDiscount is what Silpo has already taken off this cart. It travels into
+// the plan to be *stated* beside the saving, never added to it: the promotion
+// is already inside every line's price.
+const plan = buildPlan(items, selected, {
+  loyalty: cartResponse.loyalty || {},
+  cartDiscount: cart.calculation.subDiscount,
+  couponsAvailable: ((coupons && coupons.coupons) || []).length,
+  mode: input.sizeTolerance,
+});
 
 return [{ json: {
   chatId: input.chatId,
@@ -1240,7 +1263,11 @@ return [{ json: {
   promotionsCount: ((promotions && promotions.promotions) || []).length,
   couponsCount: ((coupons && coupons.coupons) || []).length,
   refreshedTokens: mcp.getRefreshed(),
-  sizeTolerance: input.sizeTolerance || 'normal',
+  // One value, two readers: the engine resolves it to a band and two confidence
+  // bars, the card prints its name. resolveMode folds the legacy pack-size
+  // presets, so an old session row needs no migration.
+  sizeTolerance: input.sizeTolerance,
+  mode: input.sizeTolerance,
   ...plan,
 } }];
 `,
@@ -1286,6 +1313,7 @@ return [{ json: {
     codeNode(
       'Finalize Plan',
       `
+${UI_MODULE}
 // Every decision and every figure was produced by the model in Optimize Cart.
 // This node only gives the plan an id and trims it down to what the apply step
 // will need, so nothing extra is persisted.
@@ -1298,11 +1326,16 @@ const summary = plan.summary;
 // diagnostics stay in memory. Keeps the stored row small and leaks less.
 const stored = {
   shoppingCartId: plan.shoppingCartId,
-  // The band this plan was judged against. Read back at apply time so changing
-  // the setting mid-flight cannot silently re-judge a plan the guest already saw.
-  sizeTolerance: plan.sizeTolerance || 'normal',
-  // Indices the guest wants applied; everything is selected by default.
-  selected: kept.map((r, i) => i),
+  // The mode this plan was judged in. Read back at apply time so changing the
+  // setting mid-flight cannot silently re-judge a plan the guest already saw,
+  // and printed on the card every time it is redrawn.
+  sizeTolerance: plan.sizeTolerance,
+  mode: plan.mode,
+  // Indices the guest wants applied. Only what cleared the confidence bar is
+  // ticked to begin with - defaultSelection decides, and the card renders the
+  // same array, so the screen and the row can never disagree about what a tap
+  // on Apply would do.
+  selected: defaultSelection(kept),
   replacements: kept.map(r => ({
     originalProductId: r.originalProductId,
     originalName: r.originalName,
@@ -1319,6 +1352,9 @@ const stored = {
     onPromotion: r.onPromotion,
     verifySize: r.verifySize,
     aiReason: r.aiReason,
+    // Persisted because the card is redrawn from this row on every toggle: a
+    // dropped flag would silently re-tick the cautious lines on the first tap.
+    confident: r.confident,
   })),
   // bonusAvailable is stored because the card is re-rendered on every tick, and
   // without it the bonus note vanished after the guest's first tap.
@@ -1327,6 +1363,8 @@ const stored = {
     saving: summary.saving,
     itemsAnalyzed: summary.itemsAnalyzed,
     bonusAvailable: summary.bonusAvailable,
+    cartDiscount: summary.cartDiscount,
+    couponsAvailable: summary.couponsAvailable,
   },
 };
 
@@ -1377,9 +1415,11 @@ ${READ_VAR}
 ${TELEGRAM_API}
 ${UI_MODULE}
 const plan = $('Finalize Plan').first().json;
-// Everything is selected to begin with; the guest unticks what they do not want.
-const selected = (plan.replacements || []).map((r, i) => i);
-const card = buildSelectionCard(plan, selected);
+// The very array that was persisted, not a second opinion about it: Finalize
+// Plan already decided which lines are ticked, and recomputing it here is how
+// the screen and the stored row drift apart.
+const stored = JSON.parse(plan.storedPlan);
+const card = buildSelectionCard(plan, stored.selected || []);
 
 const body = message(plan.chatId, card.text);
 if (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };
@@ -1494,14 +1534,16 @@ ${READ_VAR}
 ${TELEGRAM_API}
 ${UI_MODULE}
 const route = $('Merge Session').first().json;
-const allowed = ['strict', 'normal', 'loose'];
-const choice = allowed.indexOf(String(route.sizeChoice || '')) !== -1 ? route.sizeChoice : 'normal';
+// Only a key the screen itself offers may be written. A tap carries whatever
+// the keyboard put in it, and the column is read back into the engine.
+const allowed = MODE_OPTIONS.map(o => o.key);
+const choice = allowed.indexOf(String(route.sizeChoice || '')) !== -1 ? route.sizeChoice : 'balanced';
 
 const ctx = { chatId: route.chatId, messageId: route.messageId, callbackId: route.callbackId };
 // The screen is redrawn from the choice rather than from the row: the write
 // happens in the next node, and drawing the old value would show the guest a
 // setting they did not pick.
-const requests = screenRequests(buildSizesCard(choice), ctx, 'Збережено: ' + toleranceLabel(choice));
+const requests = screenRequests(buildModeCard(choice), ctx, 'Збережено: ' + modeLabel(choice));
 
 return requests.map(r => ({ json: {
   telegramUserId: route.telegramUserId,
@@ -1871,6 +1913,20 @@ const createdAt = new Date(row.createdAt || row.created_at || 0);
 if (Date.now() - createdAt.getTime() > PLAN_TTL_MINUTES * 60 * 1000) {
   return reject(UI.planStale);
 }
+
+// Apply with every box unticked. Rejected here rather than in Apply Changes for
+// one reason: this runs before Claim Plan, so the plan stays 'pending' and the
+// guest can tick something and tap again. Caught later it would burn a plan on
+// a mistap, and it would have reported "your cart moved on" - a plain untruth
+// about a cart nothing had touched.
+//
+// This is also where Task 5.2 is guaranteed: deselecting everything cannot
+// reach a write, because it never gets past this line.
+const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
+const selected = Array.isArray(plan.selected)
+  ? plan.selected
+  : (plan.replacements || []).map((r, i) => i);
+if (!selected.length) return reject(UI.nothingSelected);
 
 return [{ json: { ...row, invalid: false } }];
 `,
@@ -2291,7 +2347,7 @@ return screenRequests(card, ctx).map(r => ({ json: { url: telegramApiUrl(r.metho
   );
   screenNode('Build About', 'const card = buildAboutCard();', 900);
   screenNode('Show Brands', 'const card = buildBrandsCard(route.blockedBrands || []);', 1020);
-  screenNode('Show Sizes', 'const card = buildSizesCard(route.sizeTolerance);', 1140);
+  screenNode('Show Sizes', 'const card = buildModeCard(route.sizeTolerance);', 1140);
 
   // /start and anything unrecognised land on home. The fallback output sits
   // after every rule, so its index shifts whenever a rule is added.
@@ -2399,14 +2455,14 @@ if (!items.length) {
   return [{ json: { chatId: route.chatId, empty: true, text: UI.cartEmpty }}];
 }
 
-// An expired slot also makes Silpo report every line as out of stock.
-const slotBroken = (cart.calculation.validations || []).some(v => v.level === 'error' && v.type === 'timeslot');
 const loyalty = response.loyalty || {};
 
+// The stale-slot warning this screen used to carry is gone - see buildCartCard
+// for why. An expired slot is an unfinished checkout, not a fault, and it was
+// true for nearly every guest nearly every time.
 const card = buildCartCard(items, cart.calculation.total, {
   discount: cart.calculation.subDiscount,
   bonusAvailable: loyalty.bonusAvailable,
-  slotBroken,
 });
 
 return [{ json: { chatId: route.chatId, empty: false, text: card.text } }];
