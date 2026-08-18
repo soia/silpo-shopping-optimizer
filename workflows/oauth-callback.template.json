@@ -255,7 +255,8 @@
         },
         "additionalFields": {
           "parse_mode": "HTML",
-          "appendAttribution": false
+          "appendAttribution": false,
+          "disable_web_page_preview": true
         }
       },
       "id": "notify-connected",

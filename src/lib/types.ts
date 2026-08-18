@@ -64,6 +64,8 @@ export interface Alternate {
   companyId: string;
   branchId: string;
   name: string;
+  /** Navigational only: a promoted runner-up is named in the result message. */
+  slug: string | null;
   price: number;
   saving: number;
   brand: string | null;
@@ -79,6 +81,11 @@ export interface LoyaltyInfo {
 export interface Replacement {
   originalProductId: string;
   originalName: string;
+  /**
+   * The two product slugs, carried so the card can link each name to its Silpo
+   * page. Purely navigational — nothing in the engine reads them.
+   */
+  originalSlug: string | null;
   originalPrice: number;
   originalRatio: string | null;
   quantity: number;
@@ -86,6 +93,7 @@ export interface Replacement {
   replacementCompanyId: string;
   replacementBranchId: string;
   replacementName: string;
+  replacementSlug: string | null;
   replacementPrice: number;
   replacementRatio: string | null;
   onPromotion: boolean;

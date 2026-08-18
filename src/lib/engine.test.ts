@@ -35,8 +35,18 @@ import {
   MIN_SAVING,
   clipReason,
   type SelectedItem,
-} from './ai-ranker.ts';
-import { defaultSelection, buildSelectionCard, buildCartCard } from './ui.ts';
+} from './optimizer/index.ts';
+import {
+  defaultSelection,
+  buildSelectionCard,
+  buildCartCard,
+  buildDetailsCard,
+  buildResultText,
+  getProductUrl,
+  productLink,
+  message,
+  screenRequests,
+} from './ui.ts';
 import type { CartItem, ProductCandidate } from './types.ts';
 
 const BALANCED = sizeBand('balanced');
@@ -484,4 +494,223 @@ test('a full cart with the blank lines still fits one Telegram message', () => {
 
   assert.ok(card.text.length <= 4096, `cart card is ${card.text.length} characters`);
   assert.ok(card.text.includes('\n\n2. '), 'items are separated by a blank line');
+});
+
+/* ------------------------------------------------------------ product links */
+
+/**
+ * The product page, and why it is built rather than fetched.
+ *
+ * `silpo_get_product_details` returns the page as `product.url`, and on every
+ * product checked live it is this prefix plus the product's own slug — checked
+ * against «fintonic» too, which has no trailing id, so the rule is the slug and
+ * not the number. Every payload the bot already reads carries a slug, so no
+ * line costs an MCP call to become clickable.
+ */
+test('a product page is the canonical Silpo URL for the slug', () => {
+  assert.equal(
+    getProductUrl({ slug: 'proshutto-galbani-krudo-1027028' }),
+    'https://silpo.ua/product/proshutto-galbani-krudo-1027028',
+  );
+  // Live-verified: a slug with no trailing product id resolves the same way.
+  assert.equal(getProductUrl({ slug: 'fintonic' }), 'https://silpo.ua/product/fintonic');
+  assert.equal(getProductUrl(cartItem({ slug: 'slug-1' })), 'https://silpo.ua/product/slug-1');
+});
+
+test('no slug means no link, never a guessed one', () => {
+  // Working rule 2: a fabricated identifier lands the guest on «Resource not
+  // found», which is worse than a name that simply is not tappable.
+  for (const product of [undefined, null, {}, { slug: null }, { slug: '' }, { slug: '   ' }]) {
+    assert.equal(getProductUrl(product as { slug?: string | null }), null);
+  }
+});
+
+test('anything outside Silpo slug alphabet is refused rather than linked', () => {
+  const refused = [
+    'Молоко Яготинське',                         // a name that leaked into the field
+    'https://evil.example/x',                    // an absolute URL
+    '../../admin',                               // a path fragment
+    'slug with spaces',
+    'Slug-With-Capitals',
+    'slug"onmouseover=x',                        // an attribute break-out
+    'slug-1?utm=1',
+    'slug-1#frag',
+  ];
+  for (const slug of refused) assert.equal(getProductUrl({ slug }), null, slug);
+});
+
+test('a product name is escaped inside its link, and reads back unchanged', () => {
+  const name = 'Молоко <2.5%> & вершки "Преміум" — 1’л';
+  const html = productLink(name, { slug: 'moloko-2-5-123' });
+
+  assert.equal(
+    html,
+    '<a href="https://silpo.ua/product/moloko-2-5-123">' +
+      'Молоко &lt;2.5%&gt; &amp; вершки "Преміум" — 1’л</a>',
+  );
+  // What Telegram paints is the original name, character for character.
+  const shown = html.replace(/<[^>]+>/g, '')
+    .split('&lt;').join('<').split('&gt;').join('>').split('&amp;').join('&');
+  assert.equal(shown, name);
+  // No bare < > & survives outside a tag — Telegram rejects the whole send.
+  assert.ok(!/[<>&]/.test(html.replace(/<[^>]+>/g, '').replace(/&(amp|lt|gt);/g, '')));
+});
+
+test('a name with no link is plain escaped text, not an empty anchor', () => {
+  const html = productLink('Кава "Jacobs" <міцна> & Co', null);
+  assert.equal(html, 'Кава "Jacobs" &lt;міцна&gt; &amp; Co');
+  assert.ok(!html.includes('<a'));
+  assert.ok(!/undefined|null/.test(html));
+});
+
+test('cart lines link when they have a slug and stay plain text when they do not', () => {
+  const card = buildCartCard(
+    [
+      { name: 'Молоко <Яготинське> & Co', slug: 'moloko-iahotynske-1', price: 52.9, ratio: '900г' },
+      { name: 'Сметана', price: 32.99, ratio: '350г' },
+    ],
+    85.89,
+  );
+
+  assert.ok(card.text.includes('<a href="https://silpo.ua/product/moloko-iahotynske-1">'));
+  assert.ok(card.text.includes('Молоко &lt;Яготинське&gt; &amp; Co</a>'));
+  // The unlinked line is present, and present only once — not as an empty anchor.
+  assert.ok(card.text.includes('2. Сметана\n'));
+  assert.equal((card.text.match(/<a href=/g) || []).length, 1);
+  // Prices, quantities and the total are the card's, untouched by the link.
+  assert.ok(card.text.includes('<b>52,90 ₴</b>'));
+  assert.ok(card.text.includes('<b>85,89 ₴</b>'));
+});
+
+test('both names on a replacement row link to their own product page', () => {
+  const plan = {
+    planId: 'x',
+    summary: { originalTotal: 1000, itemsAnalyzed: 9 },
+    replacements: [{
+      originalName: 'Молоко Яготинське', originalSlug: 'moloko-iahotynske-1',
+      replacementName: 'Молоко Premia', replacementSlug: 'moloko-premiia-2',
+      originalPrice: 52.9, replacementPrice: 44.9, saving: 8, savingPct: 15,
+      confident: true, aiReason: 'Та сама жирність',
+    }],
+  };
+  const text = buildSelectionCard(plan, [0]).text;
+
+  assert.ok(text.includes('<a href="https://silpo.ua/product/moloko-iahotynske-1">Молоко Яготинське</a>'));
+  assert.ok(text.includes('<a href="https://silpo.ua/product/moloko-premiia-2">Молоко Premia</a>'));
+  // The figures are the plan's, unchanged by the links.
+  assert.ok(text.includes('Заощадите 8,00 ₴'));
+  assert.ok(text.includes('<s>52,90 ₴</s> → <b>44,90 ₴</b>'));
+  assert.ok(text.includes('економія 8,00 ₴'));
+  // The buttons are labels, not links: callback_data still drives the toggle.
+  assert.equal(buildSelectionCard(plan, [0]).keyboard[0][0].callback_data, 't:x:0');
+});
+
+test('a plan row missing a slug loses its link and nothing else', () => {
+  const plan = {
+    planId: 'x',
+    summary: { originalTotal: 1000, itemsAnalyzed: 9 },
+    replacements: [{
+      originalName: 'Сметана Яготинська', originalSlug: 'smetana-1',
+      replacementName: 'Сметана «Селянська»',
+      originalPrice: 52.99, replacementPrice: 32.99, saving: 20, savingPct: 38,
+      confident: false, aiReason: 'Та сама жирність',
+    }],
+  };
+  const card = buildSelectionCard(plan, []);
+  const details = buildDetailsCard({ ...plan, summary: { ...plan.summary, saving: 20 } }, 'x');
+
+  for (const text of [card.text, details.text]) {
+    assert.equal((text.match(/<a href=/g) || []).length, 1);
+    assert.ok(text.includes('Сметана «Селянська»'));
+    assert.ok(!text.includes('href="null"') && !text.includes('href=""'));
+  }
+  assert.ok(details.text.includes('економія 20,00 ₴'));
+});
+
+test('the result message links the products it names', () => {
+  const text = buildResultText({
+    beforeTotal: 1000, afterTotal: 900, actualSaving: 100, promisedSaving: 100, applied: 2,
+    substituted: [{
+      planned: 'Сметана «Селянська»', plannedSlug: 'smetana-selianska-1',
+      used: 'Сметана «Славія»', usedSlug: 'smetana-slaviia-2',
+    }],
+    sizeRejected: [{
+      originalName: 'Масло Президент', originalSlug: 'maslo-prezydent-3',
+      originalRatio: '200г', newRatio: '180г', tried: 2,
+    }],
+    stockRejected: [{ originalName: 'Кефір' }],
+    failed: [{ name: 'Хліб <свіжий>', error: 'boom' }],
+  }, 'Гарного дня.');
+
+  for (const slug of ['smetana-selianska-1', 'smetana-slaviia-2', 'maslo-prezydent-3']) {
+    assert.ok(text.includes('<a href="https://silpo.ua/product/' + slug + '">'), slug);
+  }
+  // The two without slugs are named in plain, escaped text.
+  assert.equal((text.match(/<a href=/g) || []).length, 3);
+  assert.ok(text.includes('· Кефір\n'));
+  assert.ok(text.includes('Хліб &lt;свіжий&gt;'));
+  // The verified numbers are still the cart's own.
+  assert.ok(text.includes('зекономлено 100,00 ₴'));
+});
+
+test('links do not cost the card any of the rows it used to show', () => {
+  // Telegram counts the text after entities are parsed, so an href is free.
+  // Counted raw, the links halved this card — sixteen replacements showed
+  // fifteen rows before they existed and eight after.
+  const plan = {
+    planId: 'big',
+    summary: { originalTotal: 4286.86, saving: 620.5, itemsAnalyzed: 22 },
+    replacements: Array.from({ length: 16 }, (_, index) => ({
+      originalName: `Ковбаса «Укрпромпостач» «Домашня» варена в/ґ, нарізка ${index + 1}`,
+      replacementName: `Ковбаса Алан «Особлива» варено-копчена в/ґ, нарізка ${index + 1}`,
+      originalSlug: `kovbasa-domashnia-${300000 + index}` as string | null,
+      replacementSlug: `kovbasa-alan-osoblyva-${400000 + index}` as string | null,
+      originalPrice: 129.9, replacementPrice: 99.9, saving: 30, savingPct: 23,
+      confident: true, aiReason: 'Та сама варена ковбаса, те саме фасування',
+    })),
+  };
+  const rows = (p: typeof plan) =>
+    (buildSelectionCard(p, defaultSelection(p.replacements)).text.match(/^      ➜ /gm) || []).length;
+
+  // The same plan with the slugs stripped is the control: whatever the budget
+  // lets through, the links must not take a row off it.
+  const unlinked = {
+    ...plan,
+    replacements: plan.replacements.map((r) => ({ ...r, originalSlug: null, replacementSlug: null })),
+  };
+  assert.equal(rows(plan), rows(unlinked));
+
+  const text = buildSelectionCard(plan, defaultSelection(plan.replacements)).text;
+  const counted = text.replace(/<a href="[^"]*">/g, '').split('</a>').join('').length;
+  assert.ok(counted <= 4096, `card counts ${counted} characters`);
+});
+
+test('a cart-validation warning links the product it names', () => {
+  // These lines are HTML now — the sentence is fixed copy, the product is not.
+  const text = buildResultText({
+    beforeTotal: 100, afterTotal: 100, actualSaving: 0, promisedSaving: 0, applied: 0,
+    validations: [
+      { level: 'error', message: 'product.offer.stock.not_enough', productName: 'Молоко & Co', productSlug: 'moloko-1' },
+      { level: 'error', message: 'product.offer.stock.not_enough', productName: 'Кефір' },
+    ],
+  }, 'Гарного дня.');
+
+  assert.ok(text.includes('<a href="https://silpo.ua/product/moloko-1">Молоко &amp; Co</a>'));
+  assert.ok(text.includes('Товар закінчився — Кефір.'));
+  assert.equal((text.match(/<a href=/g) || []).length, 1);
+  // The sentence itself is not double-escaped into visible &lt;b&gt; noise.
+  assert.ok(!text.includes('&lt;a'));
+});
+
+test('no message invites Telegram to paste a product preview under it', () => {
+  // The links made Telegram staple a photo of the cream, its shop blurb and its
+  // SEO title beneath a card that already filled the screen. message() is the
+  // only thing that sets parse_mode, so it is the only thing that has to say no.
+  assert.deepEqual(message(1, 'текст').link_preview_options, { is_disabled: true });
+
+  for (const request of screenRequests({ text: 'текст', keyboard: [] }, { chatId: 1 })) {
+    assert.deepEqual(request.body.link_preview_options, { is_disabled: true });
+  }
+  // A caller may still override it deliberately; nothing does today.
+  assert.equal(message(1, 'текст', { link_preview_options: null }).link_preview_options, null);
 });

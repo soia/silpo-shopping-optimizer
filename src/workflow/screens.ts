@@ -38,7 +38,7 @@ interface WorkflowNode {
   parameters: {
     jsCode?: string;
     text?: string;
-    additionalFields?: { parse_mode?: string };
+    additionalFields?: { parse_mode?: string; disable_web_page_preview?: boolean };
     rules?: { values: Array<{ outputKey: string }> };
   };
 }
@@ -129,11 +129,18 @@ const CART = [
   ['Пакети для сміття «Премія»® з ручками 35 л', 49.99, '30шт', 61.99],
   ['Оселедець Norsk Delikatesse норвезький молодий слабосолоний, філе в упаковці', 379, '100г', 479],
   ['Вентилятор підлоговий Grunhelm GFS-4010', 799, 'шт', 1199],
-].map(([name, price, ratio, oldPrice]) => ({ name, price, ratio, oldPrice }));
+  // Real slugs, in cart order. One line is deliberately left without one — the
+  // fallback to plain text has to be visible on the screen, not only in a test.
+].map(([name, price, ratio, oldPrice], index) => ({
+  name, price, ratio, oldPrice,
+  slug: index === 4 ? null : `tovar-${index + 1}-${100000 + index}`,
+}));
 
 /** Names carrying the three characters HTML parse mode cannot take raw. */
 const HOSTILE_CART = [
-  { name: 'Сир <Президент> 45% & вершки', price: 12.5, ratio: '200 г', oldPrice: 20 },
+  { name: 'Сир <Президент> 45% & вершки', price: 12.5, ratio: '200 г', oldPrice: 20, slug: 'syr-prezydent-45-1234' },
+  // No slug: a hostile name that is also unlinkable, which is where an escaping
+  // mistake and a fallback mistake would compound.
   { name: 'Кава "Jacobs" 3-в-1 <міцна>', price: 8, ratio: '18 г' },
 ];
 
@@ -146,12 +153,16 @@ const PLAN = {
   replacements: [
     {
       originalName: 'Молоко Яготинське 2,5% 900г', replacementName: 'Молоко Premia 2,5% 900г',
+      originalSlug: 'moloko-iahotynske-2-5-900g-123456', replacementSlug: 'moloko-ultrapasteryzovane-premiia-2-5-799508',
       originalPrice: 52.9, replacementPrice: 44.9, saving: 8, savingPct: 15, quantity: 2,
       onPromotion: true, brand: 'PREMIA', confident: true,
       aiReason: 'Молоко тієї ж жирності 2,5%, той самий обʼєм',
     },
     {
       originalName: 'Сметана Яготинська 15% 350г', replacementName: 'Сметана «Селянська_особлива» 15% 350г',
+      // No replacementSlug: the second row shows a linked original beside an
+      // unlinked replacement, which is the mixed case a real plan produces.
+      originalSlug: 'smetana-iahotynska-15-350g-223344',
       originalPrice: 52.99, replacementPrice: 32.99, saving: 20, savingPct: 38, quantity: 1,
       verifySize: true, brand: 'Селянське', confident: false,
       aiReason: 'Та сама жирність, але фасування вказане неоднозначно',
@@ -173,6 +184,8 @@ const BIG_PLAN = {
   replacements: Array.from({ length: 16 }, (_, index) => ({
     originalName: `Ковбаса «Укрпромпостач» «Домашня» варена в/ґ, нарізка ${index + 1}`,
     replacementName: `Ковбаса Алан «Особлива» варено-копчена в/ґ, нарізка ${index + 1}`,
+    originalSlug: `kovbasa-domashnia-varena-${300000 + index}`,
+    replacementSlug: `kovbasa-alan-osoblyva-vareno-kopchena-${400000 + index}`,
     originalPrice: 129.9, replacementPrice: 99.9, saving: 30, savingPct: 23, quantity: 1,
     onPromotion: index % 3 === 0, confident: index % 4 !== 0, brand: 'Алан',
     aiReason: 'Та сама варена ковбаса, те саме фасування, дешевше',
@@ -204,6 +217,8 @@ const COLLIDING_PLAN = {
   replacements: [{
     originalName: 'Напій соковмісний Моршинська зі смаком лимона негазований',
     replacementName: 'Напій соковмісний Моршинська зі смаком яблука негазований',
+    originalSlug: 'napii-sokovmisnyi-morshynska-lymon-555001',
+    replacementSlug: 'napii-sokovmisnyi-morshynska-iabluko-555002',
     originalPrice: 33.99, replacementPrice: 19.99, saving: 14, savingPct: 41,
     onPromotion: true, brand: 'Моршинська',
   }],
@@ -212,8 +227,14 @@ const COLLIDING_PLAN = {
 const RESULT = {
   beforeTotal: 1847.4, afterTotal: 1686.5, actualSaving: 160.9, promisedSaving: 186.12,
   applied: 2, deselected: 1,
-  substituted: [{ planned: 'Сметана «Селянська» 15%', used: 'Сметана «Славія» 15%' }],
-  sizeRejected: [{ originalName: 'Масло Президент 82%', originalRatio: '200 г', newRatio: '180 г', tried: 2 }],
+  substituted: [{
+    planned: 'Сметана «Селянська» 15%', plannedSlug: 'smetana-selianska-15-661001',
+    used: 'Сметана «Славія» 15%', usedSlug: 'smetana-slaviia-15-661002',
+  }],
+  sizeRejected: [{
+    originalName: 'Масло Президент 82%', originalSlug: 'maslo-prezydent-82-671001',
+    originalRatio: '200 г', newRatio: '180 г', tried: 2,
+  }],
   loyalty: { bonusAvailable: 45 }, validations: [],
 };
 
@@ -261,6 +282,7 @@ const paint = (text: string) =>
     .replace(/<b>/g, '[1m').replace(/<\/b>/g, '[22m')
     .replace(/<i>/g, '[3m').replace(/<\/i>/g, '[23m')
     .replace(/<s>/g, '[9;2m').replace(/<\/s>/g, '[29;22m')
+    .replace(/<a href="[^"]*">/g, '[4;36m').replace(/<\/a>/g, '[24;39m')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>');
 
 if (!CHECK_ONLY) {
@@ -280,15 +302,26 @@ if (!CHECK_ONLY) {
 
 console.log('\nscreens');
 
-const ALLOWED_TAGS = ['b', 'i', 's', 'u', 'code', 'pre'];
+const ALLOWED_TAGS = ['b', 'i', 's', 'u', 'code', 'pre', 'a'];
+/**
+ * Product links are the one tag carrying an attribute, so they need their own
+ * pattern — and the href is checked rather than skipped: a link to anywhere but
+ * a Silpo product page has no business on these screens.
+ */
+const ANCHOR = /<a href="([^"]*)">/g;
+const PRODUCT_HREF = /^https:\/\/silpo\.ua\/product\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 // U+FE0F only ever styles the glyph before it, so it must not count on its own.
 const EMOJI = /[\u{1F300}-\u{1FAFF}\u{2600}-\u{27BF}\u{2B00}-\u{2BFF}\u{2139}]\u{FE0F}?/gu;
 
 for (const [title, screen] of SCREENS) {
   const { text, keyboard } = typeof screen === 'string' ? { text: screen, keyboard: [] } : screen;
 
+  for (const [, href] of text.matchAll(ANCHOR)) {
+    if (!PRODUCT_HREF.test(href)) fail(`${title}: <a href="${href}"> is not a Silpo product page`);
+  }
+
   const stack: string[] = [];
-  for (const match of text.matchAll(/<(\/?)([a-z]+)>/g)) {
+  for (const match of text.replace(ANCHOR, '<a>').matchAll(/<(\/?)([a-z]+)>/g)) {
     if (!ALLOWED_TAGS.includes(match[2])) fail(`${title}: unknown tag <${match[2]}>`);
     if (match[1]) {
       if (stack.pop() !== match[2]) fail(`${title}: <${match[2]}> closed out of order`);
@@ -296,10 +329,14 @@ for (const [title, screen] of SCREENS) {
   }
   if (stack.length) fail(`${title}: unclosed <${stack.join('>, <')}>`);
 
-  const bare = text.replace(/<\/?[a-z]+>/g, '').replace(/&(amp|lt|gt);/g, '');
+  const bare = text.replace(ANCHOR, '').replace(/<\/?[a-z]+>/g, '').replace(/&(amp|lt|gt);/g, '');
   if (/[<>&]/.test(bare)) fail(`${title}: unescaped < > or & — Telegram will reject the send`);
 
-  if (text.length > 4096) fail(`${title}: ${text.length} characters, over the Telegram limit`);
+  // Telegram's cap applies to the text after entities are parsed, so the href
+  // of a product link does not count towards it. Nothing else is discounted —
+  // the tags that were counted before still are.
+  const counted = text.replace(ANCHOR, '').split('</a>').join('').length;
+  if (counted > 4096) fail(`${title}: ${counted} characters, over the Telegram limit`);
 
   for (const line of text.split('\n')) {
     const hits = line.match(EMOJI) ?? [];
@@ -336,7 +373,12 @@ else pass(`cart rhythm: every item is ${[...heights][0]} lines`);
 
 /* A clip that collides with another one hides the only word telling two
    products apart. Both lists below contain such a pair by construction. */
-const cartNames = bigCart.text.split('\n').filter((l) => /^\d+\. /.test(l));
+// Tags stripped first: two rows whose names collide now differ by their href,
+// and comparing the raw lines would report a collision as no collision.
+const cartNames = bigCart.text
+  .split('\n')
+  .filter((l) => /^\d+\. /.test(l))
+  .map((l) => l.replace(/<[^>]+>/g, ''));
 if (new Set(cartNames).size !== cartNames.length) fail('cart: two lines render identically after clipping');
 else pass('cart: no two lines are identical after clipping');
 
@@ -365,8 +407,15 @@ const telegramNodes = workflow.nodes.filter((n) => n.type === 'n8n-nodes-base.te
 for (const node of telegramNodes) {
   const mode = node.parameters.additionalFields?.parse_mode;
   if (mode !== 'HTML') fail(`${node.name}: Telegram node sends text with parse_mode=${mode ?? 'unset'}`);
+  // Product names are links, and Telegram answers the first one with a preview
+  // card — a product photo and its shop blurb stapled under a full-screen
+  // result. Every node that carries UI text has to turn it off, whether or not
+  // today's copy happens to contain a link.
+  if (node.parameters.additionalFields?.disable_web_page_preview !== true) {
+    fail(`${node.name}: Telegram node would attach a link preview under the message`);
+  }
 }
-pass(`${telegramNodes.length} Telegram nodes send with parse_mode HTML`);
+pass(`${telegramNodes.length} Telegram nodes send with parse_mode HTML and no link preview`);
 
 /* ---------------------------------------------------------------- routing */
 

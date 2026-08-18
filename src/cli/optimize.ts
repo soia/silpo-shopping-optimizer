@@ -22,7 +22,7 @@ import {
   aiStats,
   AI_ERROR_PREFIX,
   type SelectedItem,
-} from '../lib/ai-ranker.ts';
+} from '../lib/optimizer/index.ts';
 import type { CartItem, ProductCandidate } from '../lib/types.ts';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../..');

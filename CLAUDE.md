@@ -45,7 +45,7 @@ The model chooses which candidate replaces a line, whether the purchase intent
 survives, and whether the pack size is acceptable. It reads prices to do that.
 It returns `chosen` / `accept` / `confidence` / `reason` / `verifySize` /
 `alternates` — indices and words, no figures. `computeSaving()` and `buildPlan()`
-in `src/lib/ai-ranker.ts` produce every number from MCP prices.
+in `src/lib/optimizer/plan-builder.ts` produce every number from MCP prices.
 
 Why, with the measurement that settled it: on a live 22-item cart the model got
 **2 of 16 savings wrong, both on weighted lines** — a 0.3 kg line came back as
@@ -135,7 +135,7 @@ this, all silent or misleading:
 
 - A **backtick in a comment** ends the template literal. This has broken the
   build four times now — write "the require() call", never wrap it in backticks.
-  A validator check for it was tried and removed: the inlined `optimizer.ts` code
+  A validator check for it was tried and removed: the inlined engine code
   legitimately contains backticks in its comments, so the rule cannot be enforced
   from the generated output. `npm run typecheck` catches it, but the error points
   at a line far from the cause — if tsc reports an unexpected `,` or an
@@ -151,9 +151,19 @@ test the emitted code, not the source.
 
 ## 5. One source of truth for the engine — and for the copy
 
-`src/lib/ai-ranker.ts` (engine) and `src/lib/ui.ts` (every guest-facing string
+`src/lib/optimizer/` (engine) and `src/lib/ui.ts` (every guest-facing string
 and keyboard) are transpiled and inlined into the n8n Code nodes by
 `src/workflow/build.ts`.
+
+The engine is one module per responsibility behind `optimizer/index.ts`:
+`ai-client` (transport) · `ai-selector` (the model's judgement) · `prompts` ·
+`schemas` · `candidate-filter` (the gate) · `product-utils` ·
+`optimization-modes` · `confidence` · `plan-builder` (every figure) · `types`.
+Import from `optimizer/index.ts`; the barrel itself is **not** inlined, because
+the generator's `export ` strip would leave its re-exports as bare
+`{ … } from './x.ts';`. `OPTIMIZER_MODULES` in `build.ts` lists the
+implementation files in dependency order — a new module has to be added there or
+it silently never reaches the Code nodes.
 
 - **Never hand-edit `workflows/*.json`.** It is generated output.
 - Change logic in `src/lib/`, then `npm run build:workflows`.
@@ -172,7 +182,7 @@ found in a fixture, not in a bill.
 
 The engine reaches the network through an injectable fetcher. The Code-node
 sandbox has no global `fetch`, so `Optimize Cart` calls `setFetcher(httpFetch)`
-before using it; Node uses the default. Anything added to that module must stay
+before using it; Node uses the default. Anything added to the engine must stay
 transport-agnostic, and must not declare a top-level name the inlined helpers
 already use — `sleep` collided once and the node failed to compile. `npm run
 validate` catches that class of collision; nothing else does.
@@ -294,6 +304,22 @@ proposing it first.
 - The n8n Telegram node renders a keyboard declared in its parameters, so it
   cannot produce one button per replacement. The selection card and its updates
   go through the Bot API via HTTP Request, with `reply_markup` built in code.
+- **A product name is the link to its page.** `getProductUrl()` in
+  `src/lib/ui.ts` is the only place a product URL is built:
+  `https://silpo.ua/product/` + `slug`. That is not a guess —
+  `get_product_details` returns the page as `product.url`, and it is exactly
+  that prefix plus the slug on every product checked live, «fintonic» included,
+  which carries no trailing id. It is built rather than read because every
+  payload already carries `slug` while `url` arrives only from
+  `get_product_details`: reading it would cost one MCP call per rendered line.
+  A slug outside `[a-z0-9-]` gets no link at all — working rule 2 — and the name
+  renders as plain text. Never add an «Open product» button instead; fifteen
+  rows of chrome under a card whose buttons already mean something else.
+- **Telegram's 4096 cap counts the text after entities are parsed**, so an
+  href is free. The card budgets discount anchors through `budgetLength()` and
+  nothing else: counted raw, the links took a sixteen-replacement card from
+  fifteen visible rows down to eight. `<b>` and `<s>` stay counted — that
+  conservatism is the existing margin, not a bug to fix here.
 - `callback_data` is capped at **64 bytes**. That is why `plan_id` is a short
   random key rather than cartId + timestamp.
 - `replyMarkup` and `inlineKeyboard` are top-level parameters of the Telegram

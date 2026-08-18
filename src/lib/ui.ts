@@ -91,6 +91,83 @@ function s(text: string | number): string {
   return '<s>' + text + '</s>';
 }
 
+/* ------------------------------------------------------------ product links */
+
+/**
+ * The canonical Silpo product page.
+ *
+ * Not guessed and not scraped. `silpo_get_product_details` returns the page
+ * itself as `product.url`, and on every product checked live that value is
+ * exactly this prefix plus the product's own `slug` — including «fintonic»,
+ * which carries no trailing id and so proves the rule is the slug and not the
+ * number at its end.
+ *
+ * It is built here rather than read from `product.url` because every payload
+ * the bot already has carries `slug` — cart lines, search results, similar
+ * products — while `url` arrives only from `get_product_details`. Reading it
+ * would mean one MCP call per rendered line; building it costs none.
+ */
+const PRODUCT_PAGE = 'https://silpo.ua/product/';
+
+/**
+ * Silpo's slug alphabet: lowercase latin, digits, single hyphens — measured on
+ * 92 of 92 slugs in a live fixture.
+ *
+ * Anything else is not a slug this file can vouch for, and working rule 2 says
+ * what to do about it: a fabricated identifier is worse than none. A name that
+ * leaked into the field, an absolute URL, an empty string — all of them give a
+ * link that lands the guest on a «Resource not found» page, so they give no
+ * link at all instead.
+ */
+const SLUG = /^[a-z0-9]+(?:-[a-z0-9]+)*$/;
+
+/**
+ * The product page for anything that carries a slug, or null.
+ *
+ * Never throws: an absent URL is an ordinary outcome here, not a failure, and
+ * every caller renders plain text when it gets null.
+ */
+export function getProductUrl(product?: { slug?: string | null } | null): string | null {
+  const slug = product && typeof product.slug === 'string' ? product.slug.trim() : '';
+  return slug && SLUG.test(slug) ? PRODUCT_PAGE + slug : null;
+}
+
+/**
+ * Wraps text that has **already been escaped** — `clipAll()` escapes as it
+ * clips, so its output must not go through `esc()` a second time.
+ */
+function linkTo(html: string, url: string | null): string {
+  return url ? '<a href="' + esc(url) + '">' + html + '</a>' : html;
+}
+
+/**
+ * What Telegram actually counts against its 4096-character cap.
+ *
+ * The cap applies to the text *after* entities are parsed, so the markup is
+ * free — and a product link is some sixty characters of href wrapped around a
+ * name of thirty. Counted raw, the links halved the selection card the day they
+ * were added: a sixteen-replacement plan showed fifteen rows before and eight
+ * after, with the rest pushed into «Деталі» for no reason a guest could see.
+ *
+ * Only anchors are discounted. `<b>` and `<s>` are counted as before, on
+ * purpose: that conservatism is the existing margin, and widening it would
+ * change how much of every card is shown, which is not what this is for.
+ */
+function budgetLength(html: string): number {
+  return html.split('</a>').join('').replace(/<a href="[^"]*">/g, '').length;
+}
+
+/**
+ * A product name, escaped, and clickable when the product has a slug.
+ *
+ * The name itself is the link: a separate «Відкрити товар» button per line
+ * would put fifteen rows of chrome under a card whose buttons already mean
+ * something else.
+ */
+export function productLink(name: unknown, product?: { slug?: string | null } | null): string {
+  return linkTo(esc(name), getProductUrl(product));
+}
+
 /** A thin rule between a summary and its breakdown. */
 const RULE = '─'.repeat(14);
 
@@ -130,6 +207,10 @@ export interface Card {
 interface Replacement {
   originalName: string;
   replacementName: string;
+  // Slugs, so both names can link to their Silpo pages. Optional because a
+  // plan row stored before this field existed still has to render.
+  originalSlug?: string | null;
+  replacementSlug?: string | null;
   originalPrice: number;
   replacementPrice: number;
   saving: number;
@@ -597,6 +678,8 @@ export function defaultSelection(replacements: Replacement[]): number[] {
 
 interface CartLine {
   name: string;
+  /** Straight off the MCP cart line; makes the name a link to the product page. */
+  slug?: string | null;
   price: number;
   quantity?: number;
   ratio?: string;
@@ -652,7 +735,9 @@ export function buildCartCard(
     if (item.quantity && item.quantity > 1) tail.push('× ' + item.quantity);
     if (item.ratio) tail.push(esc(item.ratio));
     return (
-      (index + 1) + '. ' + names[index] + '\n     ' +
+      // The name carries the link; the price line under it stays plain, so the
+      // tap target is the product and nothing else on the row.
+      (index + 1) + '. ' + linkTo(names[index], getProductUrl(item)) + '\n     ' +
       meta.join(' ') + (tail.length ? ' · ' + tail.join(' · ') : '')
     );
   });
@@ -691,7 +776,7 @@ export function buildCartCard(
   for (const item of items) {
     const next = (kept ? '\n\n' : '') + item;
     // 90 characters held back for the «…і ще N позицій» line this may need.
-    if (text.length + next.length + tail.length + 90 > BUDGET) break;
+    if (budgetLength(text) + budgetLength(next) + tail.length + 90 > BUDGET) break;
     text += next;
     kept++;
   }
@@ -800,8 +885,9 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
     if (r.onPromotion) facts.push('за акцією');
 
     const head =
-      (on ? ON : OFF) + ' ' + b(index + 1 + '.') + ' ' + clipped[index] + '\n' +
-      '      ➜ ' + clipped[replacements.length + index] + '\n' +
+      (on ? ON : OFF) + ' ' + b(index + 1 + '.') + ' ' +
+      linkTo(clipped[index], getProductUrl({ slug: r.originalSlug })) + '\n' +
+      '      ➜ ' + linkTo(clipped[replacements.length + index], getProductUrl({ slug: r.replacementSlug })) + '\n' +
       '      ' + priceLine + '\n' +
       '      ' + facts.join(' · ') + '\n';
 
@@ -843,7 +929,7 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   // still to come, and they are the part a guest must not lose.
   const LIMIT = 3600;
   const withReasons = blocks.reduce(
-    (sum, blk) => sum + blk.head.length + blk.reason.length + GAP.length,
+    (sum, blk) => sum + budgetLength(blk.head) + blk.reason.length + GAP.length,
     0,
   );
   const withReason = text.length + withReasons + footer.length <= LIMIT;
@@ -851,7 +937,7 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   let shown = 0;
   for (const block of blocks) {
     const next = block.head + (withReason ? block.reason : '') + GAP;
-    if (text.length + next.length + footer.length > LIMIT) break;
+    if (budgetLength(text) + budgetLength(next) + footer.length > LIMIT) break;
     text += next;
     shown++;
   }
@@ -929,12 +1015,12 @@ export function buildDetailsCard(plan: Plan, planId: string): Card {
   // the guest opened it precisely to read what the card abbreviated.
   const blocks = replacements.map((r, i) => {
     const lines = [
-      '<b>' + (i + 1) + '.</b> ' + esc(r.originalName),
+      '<b>' + (i + 1) + '.</b> ' + productLink(r.originalName, { slug: r.originalSlug }),
       // Struck through here too, so the card and its details tell the same
       // visual story: this price is the one being left behind.
       '      ' + s(money(r.originalPrice)) + (r.quantity && r.quantity > 1 ? ' × ' + r.quantity : ''),
       '      ⬇',
-      '      ' + esc(r.replacementName),
+      '      ' + productLink(r.replacementName, { slug: r.replacementSlug }),
       '      <b>' + money(r.replacementPrice) + '</b>' + (r.onPromotion ? ' · 🎁 акція' : ''),
       '      💰 економія ' + money(r.saving) + (r.savingPct ? ' · −' + r.savingPct + '%' : ''),
     ];
@@ -955,7 +1041,7 @@ export function buildDetailsCard(plan: Plan, planId: string): Card {
   const LIMIT = 3900;
   const kept: string[] = [];
   for (const block of blocks) {
-    if ((text + kept.join('\n\n') + block).length > LIMIT) break;
+    if (budgetLength(text + kept.join('\n\n') + block) > LIMIT) break;
     kept.push(block);
   }
   text += kept.join('\n\n');
@@ -982,14 +1068,14 @@ interface ApplyResult {
   actualSaving: number;
   promisedSaving: number;
   applied: number;
-  failed?: Array<{ name: string; error: unknown }>;
-  stockRejected?: Array<{ originalName: string; tried?: number }>;
-  sizeRejected?: Array<{ originalName: string; originalRatio: string; newRatio: string; tried?: number }>;
-  substituted?: Array<{ planned: string; used: string }>;
+  failed?: Array<{ name: string; slug?: string | null; error: unknown }>;
+  stockRejected?: Array<{ originalName: string; originalSlug?: string | null; tried?: number }>;
+  sizeRejected?: Array<{ originalName: string; originalSlug?: string | null; originalRatio: string; newRatio: string; tried?: number }>;
+  substituted?: Array<{ planned: string; plannedSlug?: string | null; used: string; usedSlug?: string | null }>;
   vanished?: number;
   deselected?: number;
   loyalty?: { bonusAvailable?: number };
-  validations?: Array<{ level: string; message: string; productName?: string | null }>;
+  validations?: Array<{ level: string; message: string; productName?: string | null; productSlug?: string | null }>;
 }
 
 /**
@@ -1005,14 +1091,18 @@ interface ApplyResult {
  * warning stays out of the way instead of adding noise.
  */
 export function validationLines(
-  validations: Array<{ level: string; message: string; productName?: string | null }>,
+  validations: Array<{ level: string; message: string; productName?: string | null; productSlug?: string | null }>,
 ): string[] {
   const lines: string[] = [];
   let unknownErrors = 0;
 
   for (const v of validations) {
     const key = String(v.message || '');
-    const name = v.productName ? ' — ' + v.productName : '';
+    // Returned as HTML rather than plain text, because the product named here
+    // is a product the guest may want to open. The fixed sentences around it
+    // carry no character HTML mode objects to; the name is escaped by
+    // productLink() and nothing else on the line is dynamic.
+    const name = v.productName ? ' — ' + productLink(v.productName, { slug: v.productSlug }) : '';
 
     if (key.indexOf('product.offer.stock') === 0) {
       lines.push('Товар закінчився' + name + '. Приберіть або замініть його, щоб оформити замовлення.');
@@ -1159,7 +1249,9 @@ export function buildResultText(result: ApplyResult, wish: string): string {
   if (result.substituted && result.substituted.length) {
     text += '\n\n' + RULE + '\n🔄 <b>Взяв інший товар</b>\n';
     text += result.substituted
-      .map((item) => '· замість ' + esc(item.planned) + '\n  взяв ' + esc(item.used))
+      .map((item) =>
+        '· замість ' + productLink(item.planned, { slug: item.plannedSlug }) +
+        '\n  взяв ' + productLink(item.used, { slug: item.usedSlug }))
       .join('\n');
   }
 
@@ -1167,7 +1259,7 @@ export function buildResultText(result: ApplyResult, wish: string): string {
     text += '\n\n' + RULE + '\n🚫 <b>Доступної заміни не знайшов</b>\n';
     text += result.stockRejected
       .map((item) =>
-        '· ' + esc(item.originalName) + '\n  ' +
+        '· ' + productLink(item.originalName, { slug: item.originalSlug }) + '\n  ' +
         (item.tried && item.tried > 1
           ? 'перебрав ' + item.tried + ' варіанти — усі виявились недоступні'
           : 'залишив оригінал'))
@@ -1179,7 +1271,8 @@ export function buildResultText(result: ApplyResult, wish: string): string {
     text += '\n\n' + RULE + '\n📦 <b>Заміни того ж об’єму не знайшов</b>\n';
     text += result.sizeRejected
       .map((item) =>
-        '· ' + esc(item.originalName) + ' (' + esc(item.originalRatio) + ')\n  найближче було ' +
+        '· ' + productLink(item.originalName, { slug: item.originalSlug }) +
+        ' (' + esc(item.originalRatio) + ')\n  найближче було ' +
         esc(item.newRatio) + ' — не підійшло' + (item.tried && item.tried > 1 ? ', перебрав ' + item.tried + ' варіанти' : '') +
         '\n  залишив оригінал')
       .join('\n');
@@ -1192,7 +1285,9 @@ export function buildResultText(result: ApplyResult, wish: string): string {
   if (result.failed && result.failed.length) {
     text += '\n\n' + RULE + '\n⚠️ <b>Не вдалося застосувати</b>\n';
     text += result.failed
-      .map((item) => '· ' + esc(item.name) + '\n  <i>' + esc(String(item.error).slice(0, 140)) + '</i>')
+      .map((item) =>
+        '· ' + productLink(item.name, { slug: item.slug }) +
+        '\n  <i>' + esc(String(item.error).slice(0, 140)) + '</i>')
       .join('\n');
   }
 
@@ -1207,7 +1302,8 @@ export function buildResultText(result: ApplyResult, wish: string): string {
 
   const issues = validationLines(result.validations || []);
   if (issues.length) {
-    text += '\n\n⚠️ <b>Кошик потребує уваги</b>\n' + issues.map((line) => esc(line)).join('\n');
+    // Already HTML: validationLines() escapes the one dynamic part itself.
+    text += '\n\n⚠️ <b>Кошик потребує уваги</b>\n' + issues.join('\n');
   }
 
   // The receipt wish closes the message the way a till slip closes a purchase.
@@ -1269,7 +1365,18 @@ export interface ScreenRequest {
  * and shipped exactly that. Nothing constructs a message body directly any more.
  */
 export function message(chatId: number | string, text: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
-  return { chat_id: chatId, text, parse_mode: 'HTML', ...extra };
+  return {
+    chat_id: chatId,
+    text,
+    parse_mode: 'HTML',
+    // Product names are links now, and Telegram answers the first link in a
+    // message with a preview card: a photo of the cream, its shop blurb and its
+    // SEO title, pinned under a card that was already the length of the screen.
+    // The guest scrolls past their own result to reach it. Off here, in the one
+    // place that sets parse_mode, so no body can be built without it.
+    link_preview_options: { is_disabled: true },
+    ...extra,
+  };
 }
 
 /**

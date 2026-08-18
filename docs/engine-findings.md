@@ -2,7 +2,7 @@
 
 > **Superseded on 2026-08-17.** Everything below measures the deterministic
 > scorer in `src/lib/optimizer.ts`, which has been removed. The model now makes
-> every decision and computes every figure (`src/lib/ai-ranker.ts`). The section
+> every decision and code computes every figure (`src/lib/optimizer/`). The section
 > at the end records the current measurements; the rest is kept because its
 > failure analysis is what the new engine was built against.
 

@@ -108,7 +108,7 @@ n8n instance to a working agent.
 ## Layout
 
 ```
-src/lib/          mcp.ts · optimizer.ts · ai-ranker.ts · types.ts
+src/lib/          mcp.ts · optimizer/ · ui.ts · types.ts
 src/cli/          authorize · call-tool · optimize
 src/workflow/     build · validate · test-node
 workflows/        generated n8n JSON — import these
@@ -118,12 +118,13 @@ data/             raw tools/list dump from the live server
 
 ### One source of truth
 
-The optimization engine lives in a single file,
-[`src/lib/optimizer.ts`](src/lib/optimizer.ts), and is **inlined into the n8n
+The optimization engine lives in one place,
+[`src/lib/optimizer/`](src/lib/optimizer/) — one module per responsibility
+behind [`index.ts`](src/lib/optimizer/index.ts) — and is **inlined into the n8n
 Code nodes by the generator** rather than copied by hand:
 
 ```
-src/lib/optimizer.ts ──transpile──> Code nodes ──> workflows/*.json
+src/lib/optimizer/*.ts ──transpile──> Code nodes ──> workflows/*.json
 ```
 
 Change the logic there, run `npm run build:workflows`, and the workflow cannot

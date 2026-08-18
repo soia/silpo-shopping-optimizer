@@ -2,8 +2,8 @@
  * Generates the importable n8n workflow JSON.
  *
  * Why a generator instead of hand-written JSON: the optimization engine is
- * inlined into the Code nodes straight from `src/lib/optimizer.ts` — the same
- * file the local runs and the type checker use. One source of truth, so the
+ * inlined into the Code nodes straight from `src/lib/optimizer/` — the same
+ * files the local runs and the type checker use. One source of truth, so the
  * workflow can never drift from the logic that was actually verified.
  *
  * Note on language: code comments and identifiers are English, but strings the
@@ -57,12 +57,40 @@ function inlineModule(relativePath: string): string {
 /**
  * The decision engine, inlined into the Code node that runs it.
  *
- * `src/lib/ai-ranker.ts` replaced the hand-written scorer: the model chooses
- * the replacement and computes every figure. The module reaches the network
+ * `src/lib/optimizer/` replaced the hand-written scorer: the model chooses the
+ * replacement and code computes every figure. The engine reaches the network
  * through an injectable fetcher, so the node calls `setFetcher(httpFetch)`
  * before using it — the sandbox has no global `fetch`.
+ *
+ * Listed file by file rather than through `optimizer/index.ts`, and the order
+ * matters twice over:
+ *
+ *   - `index.ts` is a barrel of `export … from` lines. The inliner strips the
+ *     leading `export `, which would leave bare `{ … } from './x.ts';` in the
+ *     node — a syntax error. It is deliberately not in this list.
+ *   - Concatenation flattens every module into one scope, so a module has to
+ *     appear after the ones it reads at load time. Dependency order below.
+ *
+ * The flattening is also why nothing here may declare a top-level name the other
+ * inlined helpers already use — `sleep` collided once and the node failed to
+ * compile. `npm run validate` is what catches that class of mistake.
  */
-const AI_RANKER = inlineModule('src/lib/ai-ranker.ts');
+const OPTIMIZER_MODULES = [
+  'types.ts',
+  'product-utils.ts',
+  'optimization-modes.ts',
+  'confidence.ts',
+  'schemas.ts',
+  'candidate-filter.ts',
+  'prompts.ts',
+  'plan-builder.ts',
+  'ai-client.ts',
+  'ai-selector.ts',
+];
+
+const AI_RANKER = OPTIMIZER_MODULES.map((file) => inlineModule(`src/lib/optimizer/${file}`))
+  .filter(Boolean)
+  .join('\n\n');
 
 /**
  * The presentation layer, inlined the same way the engine is.
@@ -937,7 +965,7 @@ return out;
             },
           ],
         },
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 960, y: -320 },
     ),
@@ -974,7 +1002,7 @@ return out;
         inlineKeyboard: {
           rows: [{ row: { buttons: [{ text: BUTTON.connect, additionalFields: { type: 'callback_data', callback_data: 'connect:' } }] } }],
         },
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 740, y: 160 },
     ),
@@ -1231,6 +1259,9 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
     companyId: o.candidate.companyId,
     branchId: o.candidate.branchId,
     name: o.candidate.name,
+    // Carried so a promoted runner-up is still a link when the result message
+    // names it. Navigational only - nothing decides anything from it.
+    slug: o.candidate.slug || null,
     price: o.candidate.price,
     saving: o.saving,
     brand: o.candidate.brand || null,
@@ -1302,7 +1333,7 @@ return [{ json: {
       {
         chatId: '={{ $json.chatId }}',
         text: UI.cartEmptyForOptimize,
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 1400, y: 60 },
     ),
@@ -1339,12 +1370,16 @@ const stored = {
   replacements: kept.map(r => ({
     originalProductId: r.originalProductId,
     originalName: r.originalName,
+    // Both slugs are persisted because the card is redrawn from this row on
+    // every toggle: without them the names stop being links after the first tap.
+    originalSlug: r.originalSlug,
     originalPrice: r.originalPrice,
     quantity: r.quantity,
     replacementProductId: r.replacementProductId,
     replacementCompanyId: r.replacementCompanyId,
     replacementBranchId: r.replacementBranchId,
     replacementName: r.replacementName,
+    replacementSlug: r.replacementSlug,
     replacementPrice: r.replacementPrice,
     alternates: r.alternates || [],
     saving: r.saving,
@@ -1776,7 +1811,7 @@ return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'),
       {
         chatId: "={{ $('Prepare Logout').first().json.chatId }}",
         text: UI.logoutDone,
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       // Delete Plans emits one item per deleted row; without this the guest gets
       // one confirmation per plan they had stored.
@@ -1998,6 +2033,7 @@ const queue = applicable.map(replacement => {
     companyId: replacement.replacementCompanyId,
     branchId: replacement.replacementBranchId,
     name: replacement.replacementName,
+    slug: replacement.replacementSlug || null,
     price: replacement.replacementPrice,
     saving: replacement.saving,
   };
@@ -2111,6 +2147,7 @@ if (confirmed.length) {
 const sizeRejected = queue.filter(q => !q.settled && q.reason === 'size')
   .map(q => ({
     originalName: q.replacement.originalName,
+    originalSlug: q.replacement.originalSlug || null,
     name: q.detail.name,
     originalRatio: q.detail.from,
     newRatio: q.detail.to,
@@ -2120,15 +2157,22 @@ const sizeRejected = queue.filter(q => !q.settled && q.reason === 'size')
 const stockRejected = queue.filter(q => !q.settled && q.reason === 'unavailable')
   .map(q => ({
     originalName: q.replacement.originalName,
+    originalSlug: q.replacement.originalSlug || null,
     name: q.detail,
     tried: q.attempt,
     available: q.options.length,
   }));
 for (const q of queue.filter(q => !q.settled && q.reason === 'add-failed')) {
-  failed.push({ name: q.options[Math.min(q.attempt, q.options.length - 1)].name, error: q.detail });
+  const option = q.options[Math.min(q.attempt, q.options.length - 1)];
+  failed.push({ name: option.name, slug: option.slug || null, error: q.detail });
 }
 const substituted = confirmed.filter(q => q.chosen.fallbackUsed)
-  .map(q => ({ planned: q.replacement.replacementName, used: q.chosen.option.name }));
+  .map(q => ({
+    planned: q.replacement.replacementName,
+    plannedSlug: q.replacement.replacementSlug || null,
+    used: q.chosen.option.name,
+    usedSlug: q.chosen.option.slug || null,
+  }));
 
 
 // Mandatory verification: the headline number must come from the cart itself.
@@ -2159,7 +2203,11 @@ return [{ json: {
   validations: (after.cart.calculation.validations || []).map(v => {
     const pid = v.context && v.context.productId;
     const line = pid ? afterItems.find(i => i.productId === pid) : null;
-    return { level: v.level, type: v.type, message: v.message, productName: line ? line.name : null };
+    return {
+      level: v.level, type: v.type, message: v.message,
+      productName: line ? line.name : null,
+      productSlug: line ? line.slug : null,
+    };
   }),
 }}];
 `,
@@ -2208,7 +2256,7 @@ return [{ json: {
       {
         chatId: "={{ $('Merge Session').first().json.chatId }}",
         text: UI.applying,
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 1180, y: 240 },
     ),
@@ -2221,7 +2269,7 @@ return [{ json: {
       'Send Plan Invalid',
       // parse_mode on every node that carries UI text, whether or not today's
       // copy happens to contain a tag: the copy changes, the node does not.
-      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
+      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true } },
       { x: 960, y: 440 },
     ),
   );
@@ -2298,7 +2346,7 @@ return [{ json: { chatId: result.chatId, text } }];
         inlineKeyboard: {
           rows: [{ row: { buttons: [{ text: BUTTON.cart, additionalFields: { type: 'callback_data', callback_data: 'cart:' } }] } }],
         },
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 1400, y: 320 },
     ),
@@ -2309,7 +2357,7 @@ return [{ json: { chatId: result.chatId, text } }];
   nodes.push(
     telegramNode(
       'Send Cancelled',
-      { chatId: '={{ $json.chatId }}', text: UI.cancelled, additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
+      { chatId: '={{ $json.chatId }}', text: UI.cancelled, additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true } },
       { x: 520, y: 520 },
     ),
   );
@@ -2499,7 +2547,7 @@ return [{ json: { chatId: route.chatId, empty: false, text: card.text } }];
       {
         chatId: '={{ $json.chatId }}',
         text: '={{ $json.text }}',
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 960, y: 1100 },
     ),
@@ -2522,7 +2570,7 @@ return [{ json: { chatId: route.chatId, empty: false, text: card.text } }];
             },
           ],
         },
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 960, y: 900 },
     ),
@@ -2617,7 +2665,7 @@ return [{ json: { chatId: route.chatId, text } }];
   nodes.push(
     telegramNode(
       'Send Error',
-      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false } },
+      { chatId: '={{ $json.chatId }}', text: '={{ $json.text }}', additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true } },
       { x: 1180, y: 660 },
     ),
   );
@@ -2782,7 +2830,7 @@ return [{ json: {
             { row: { buttons: [{ text: BUTTON.optimize, additionalFields: { type: 'callback_data', callback_data: 'optimize:' } }] } },
           ],
         },
-        additionalFields: { parse_mode: 'HTML', appendAttribution: false },
+        additionalFields: { parse_mode: 'HTML', appendAttribution: false, disable_web_page_preview: true },
       },
       { x: 1320, y: -100 },
     ),
