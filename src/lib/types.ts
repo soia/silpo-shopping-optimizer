@@ -69,6 +69,20 @@ export interface Alternate {
   price: number;
   saving: number;
   brand: string | null;
+  /**
+   * The model's own words about *this* candidate, carried since the guest can
+   * now pick it by hand. Without it, a chosen runner-up would inherit the
+   * primary's reason — a sentence written about a different product.
+   */
+  reason?: string | null;
+  /** Its confidence against the mode's tick bar, resolved where the bars live. */
+  confident?: boolean;
+  /**
+   * Whether it clears `minConfidence` and may therefore be *offered* to the
+   * guest. The array itself stays complete: apply-time fallback may still reach
+   * for a candidate that was never worth putting on a screen.
+   */
+  offerable?: boolean;
 }
 
 export interface LoyaltyInfo {

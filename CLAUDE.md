@@ -371,6 +371,32 @@ Consequences to respect:
 - Column mappings need the `schema` array alongside `value`, or the resource
   mapper will not bind the fields.
 - Recreating a table changes its id — update `TABLES` and rebuild.
+- **A column the code writes has to exist in the table.** Adding one to `TABLES`
+  does not create it: an existing table keeps its old shape, and the write then
+  throws `unknown column name`. `size_tolerance` arrived with the optimization
+  modes and was missing from a table created before them; the setting saved
+  nothing for as long as it took to find that out. Add the column in **Data
+  tables → the table → Add Column**; the id does not change.
+- **The Data Table node swallows its own errors, and its error output never
+  fires.** `router.ts` catches every exception whenever `continueOnFail()` is
+  true — and that is true for `continueRegularOutput` *and* for
+  `continueErrorOutput` — then pushes the node's **input item** into the regular
+  output. It attaches the error only for `NodeApiError`/`NodeOperationError`, and
+  a table error (`DataTableValidationError extends UserError`) is neither. So:
+  wiring an error output on this node hides the failure instead of surfacing it,
+  and a node that "succeeded" proves nothing about the write. Without `onError`
+  it throws and the message is at least in the execution log.
+- **Read what the write returned.** `update` returns the rows it changed, so the
+  state after a write needs no second read — and an item that is not a table row
+  means the write never happened. The mode screen was drawn from the tapped
+  choice instead, so it confirmed a setting the table did not have; the guest
+  only found out on the next visit to Settings.
+- **`$json` vs `$('Node')` in a filter: the test is what feeds the node.** Use
+  `$json` when the node's own input carries the field — `Save Size` sits directly
+  under `Update Size`. Name the node when it does not: `Clear Session` is fed by
+  the *HTTP response* of `Send Logout Reply`, and `$json.telegramUserId` there is
+  undefined, which matches no row and reports success. Logout confirmed itself
+  while leaving the tokens in place.
 
 ## 15. Rate limits and resilience
 

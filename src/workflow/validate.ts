@@ -79,6 +79,34 @@ for (const file of FILES) {
     }
   }
 
+  /*
+   * A node that calls a helper it never inlined.
+   *
+   * The Code nodes are assembled by concatenating helper blocks — `READ_VAR`,
+   * `TELEGRAM_API`, `MCP_CLIENT` — ahead of the node's own body, and forgetting
+   * one produces code that compiles perfectly and dies on its first line with
+   * "readVar is not defined". `Show Alternatives` shipped exactly that: the
+   * button was drawn, the tap routed, and the branch threw before doing
+   * anything, so the guest saw nothing happen at all.
+   *
+   * Only the cross-cutting helpers are listed. They are the ones a new node has
+   * to remember to bring with it; everything else arrives inside a module that
+   * is inlined whole.
+   */
+  const HELPERS = ['readVar', 'telegramApiUrl', 'httpFetch', 'createMcp', 'encrypt', 'decrypt'];
+  let helperUses = 0;
+  for (const node of workflow.nodes.filter((n) => n.type === 'n8n-nodes-base.code')) {
+    const jsCode = node.parameters.jsCode ?? '';
+    for (const helper of HELPERS) {
+      if (!new RegExp(`(?<![\\w.])${helper}\\s*\\(`).test(jsCode)) continue;
+      helperUses++;
+      if (!new RegExp(`(?:function|const|let|var)\\s+${helper}\\b`).test(jsCode)) {
+        fail(`"${node.name}" calls ${helper}() but never inlines it — the node throws on its first line`);
+      }
+    }
+  }
+  if (helperUses) pass(`${helperUses} helper calls, every one of them defined in its node`);
+
   const usedTools = new Set<string>();
   for (const node of workflow.nodes) {
     for (const match of (node.parameters.jsCode ?? '').matchAll(/call\(['"](silpo_[a-z_]+)['"]/g)) {

@@ -8,7 +8,7 @@
  * percentages and all totals exact.
  */
 
-import type { CartItem, OptimizationPlan, PlanSummary, Replacement } from '../types.ts';
+import type { Alternate, CartItem, OptimizationPlan, PlanSummary, Replacement } from '../types.ts';
 import type { PlanContext, SelectedItem } from './types.ts';
 import { round2 } from './product-utils.ts';
 import { MIN_SAVING } from './candidate-filter.ts';
@@ -110,4 +110,84 @@ export function buildPlan(
   };
 
   return { replacements, rejectedByAI: rejected, summary };
+}
+
+/**
+ * Swaps a chosen runner-up into the primary slot of one line.
+ *
+ * The guest taps «Інші варіанти» and picks one; from that moment the picked
+ * product is an ordinary replacement, not a footnote on somebody else's. That is
+ * the whole point of doing it here rather than storing a `selectedAlternateIndex`
+ * beside the plan: the apply step, the details screen and the card all read
+ * `replacementProductId` and `saving`, and none of them should have to learn
+ * about a second, shadow choice.
+ *
+ * The old primary swaps places with it and goes to the head of `alternates`, so
+ * changing one's mind costs one more tap and no re-run — and so apply-time
+ * fallback keeps a candidate that already cleared every check.
+ *
+ * Figures are recomputed here from the two prices, per working rule 3, and never
+ * carried over from the alternate's stored `saving`: quantity belongs to the
+ * line, not to the candidate.
+ */
+export function applyAlternate(
+  plan: { replacements?: Replacement[]; summary?: { saving?: number } },
+  replacementIndex: number,
+  alternateIndex: number,
+): { ok: boolean; reason?: 'no-replacement' | 'no-alternate' | 'no-saving' } {
+  const replacements = plan.replacements ?? [];
+  const line = replacements[replacementIndex];
+  if (!line) return { ok: false, reason: 'no-replacement' };
+
+  const alternates = line.alternates ?? [];
+  const picked = alternates[alternateIndex];
+  // `offerable` is what the card put a button on; anything else arriving here is
+  // a stale keyboard from before a redraw, not a choice the guest could see.
+  if (!picked || picked.offerable === false) return { ok: false, reason: 'no-alternate' };
+
+  const { saving, savingPct } = computeSaving(
+    { price: line.originalPrice, quantity: line.quantity },
+    { price: picked.price },
+  );
+  // The floor the gate applies to every other proposal. A candidate that no
+  // longer clears it is not offered a second door in through the UI.
+  if (saving < MIN_SAVING) return { ok: false, reason: 'no-saving' };
+
+  const demoted: Alternate = {
+    productId: line.replacementProductId,
+    companyId: line.replacementCompanyId,
+    branchId: line.replacementBranchId,
+    name: line.replacementName,
+    slug: line.replacementSlug,
+    price: line.replacementPrice,
+    saving: line.saving,
+    brand: line.brand ?? null,
+    reason: line.aiReason ?? null,
+    confident: line.confident,
+    // It was on the card a moment ago, so it is by definition offerable.
+    offerable: true,
+  };
+
+  line.replacementProductId = picked.productId;
+  line.replacementCompanyId = picked.companyId;
+  line.replacementBranchId = picked.branchId;
+  line.replacementName = picked.name;
+  line.replacementSlug = picked.slug ?? null;
+  line.replacementPrice = picked.price;
+  line.brand = picked.brand ?? null;
+  line.aiReason = picked.reason ?? null;
+  line.confident = picked.confident;
+  line.saving = saving;
+  line.savingPct = savingPct;
+  // Pack size was read for the primary; nothing confirmed it for this one, so it
+  // is dropped rather than inherited. Apply verifies it from the cart anyway.
+  line.replacementRatio = null;
+  line.alternates = [demoted].concat(alternates.filter((_, i) => i !== alternateIndex));
+
+  // The headline is the sum of every line, ticked or not — the card derives the
+  // ticked figure itself. Recomputed, never adjusted by a delta.
+  if (plan.summary) {
+    plan.summary.saving = round2(replacements.reduce((sum, r) => sum + r.saving, 0));
+  }
+  return { ok: true };
 }

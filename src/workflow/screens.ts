@@ -75,8 +75,10 @@ interface UiModule {
   buildAboutCard: () => Card;
   buildBrandsCard: (brands: string[], notice?: string) => Card;
   buildModeCard: (mode?: string | null, notice?: string) => Card;
+  modeNotice: (stored: string | null, requested: string) => string;
   buildCartCard: (lines: unknown[], total: number, extras?: unknown) => Card;
   buildSelectionCard: (plan: unknown, selected: number[]) => Card;
+  buildAlternativesCard: (plan: unknown, index: number, notice?: string) => Card;
   defaultSelection: (replacements: Array<{ confident?: boolean; saving: number }>) => number[];
   buildDetailsCard: (plan: unknown, planId: string) => Card;
   buildResultText: (result: unknown, wish: string) => string;
@@ -101,7 +103,7 @@ function loadUi(): UiModule {
   const names: Array<keyof UiModule> = [
     'UI', 'BUTTON', 'COMMANDS', 'BRAND_PROMPT_MARKER',
     'buildHomeCard', 'buildSettingsCard', 'buildAboutCard', 'buildBrandsCard', 'buildModeCard',
-    'buildCartCard', 'buildSelectionCard', 'defaultSelection', 'buildDetailsCard', 'buildResultText',
+    'modeNotice', 'buildCartCard', 'buildSelectionCard', 'buildAlternativesCard', 'defaultSelection', 'buildDetailsCard', 'buildResultText',
     'buildErrorText', 'brandToast', 'logoutKeyboard', 'homeKeyboard',
     'screenRequests', 'brandPromptRequest',
   ];
@@ -157,6 +159,31 @@ const PLAN = {
       originalPrice: 52.9, replacementPrice: 44.9, saving: 8, savingPct: 15, quantity: 2,
       onPromotion: true, brand: 'PREMIA', confident: true,
       aiReason: 'Молоко тієї ж жирності 2,5%, той самий обʼєм',
+      // Two confirmed runners-up and one the run kept but may not offer: the
+      // «Інші варіанти» screen has to draw the first two and no button at all
+      // for the third.
+      alternates: [
+        {
+          productId: 'a1', companyId: 'c1', branchId: 'b1',
+          name: 'Молоко «Простонаше» ультрапастеризоване 2,5% 900г',
+          slug: 'moloko-prostonashe-ultrapasterizovane-2-5-900g-661234',
+          price: 47.9, saving: 10, brand: 'Простонаше', confident: true, offerable: true,
+          reason: 'Те саме молоко 2,5%, той самий обʼєм, інша марка',
+        },
+        {
+          productId: 'a2', companyId: 'c1', branchId: 'b1',
+          name: 'Молоко «Селянське» особливе ультрапастеризоване 2,5% 900г',
+          slug: 'moloko-selianske-osoblyve-2-5-900g-661235',
+          price: 49.9, saving: 6, brand: 'Селянське', confident: false, offerable: true,
+          reason: 'Та сама жирність і фасування, дорожче за перший варіант',
+        },
+        {
+          productId: 'a3', companyId: 'c1', branchId: 'b1',
+          name: 'Напій мигдалевий «Alpro» 900мл', slug: 'napii-mygdalevyi-alpro-900ml-661236',
+          price: 44.9, saving: 16, brand: 'Alpro', confident: false, offerable: false,
+          reason: 'Рослинний напій, а не молоко',
+        },
+      ],
     },
     {
       originalName: 'Сметана Яготинська 15% 350г', replacementName: 'Сметана «Селянська_особлива» 15% 350г',
@@ -255,6 +282,9 @@ const SCREENS: Array<[string, Card | string]> = [
   ['results — nothing confident', ui.buildSelectionCard(CAUTIOUS_PLAN, ui.defaultSelection(CAUTIOUS_PLAN.replacements))],
   ['results — colliding names', ui.buildSelectionCard(COLLIDING_PLAN, [0])],
   ['results — nothing found', ui.buildSelectionCard({ planId: 'x', summary: { originalTotal: 1847.4, itemsAnalyzed: 12, bonusAvailable: 45 }, replacements: [] }, [])],
+  ['alternatives', ui.buildAlternativesCard(PLAN, 0)],
+  ['alternatives — nothing left to offer', ui.buildAlternativesCard(PLAN, 1)],
+  ['alternatives — stale tap', ui.buildAlternativesCard(PLAN, 0, ui.UI.alternateGone)],
   ['details', ui.buildDetailsCard(PLAN, PLAN.planId)],
   ['applying', ui.UI.applying],
   ['applied', ui.buildResultText(RESULT, 'Дрібні заощадження мають звичку перетворюватися на великі радощі.')],
@@ -267,7 +297,10 @@ const SCREENS: Array<[string, Card | string]> = [
   ['brands — after /block', ui.buildBrandsCard(['Премія', 'Ascania'], ui.brandToast('added', 'Ascania'))],
   ['mode — balanced', ui.buildModeCard('balanced')],
   ['mode — legacy value «strict»', ui.buildModeCard('strict')],
-  ['mode — after tap', ui.buildModeCard('max', 'Збережено: максимальна економія')],
+  // Both drawn the way `Confirm Size` draws them: from the row read back after
+  // the write, with the notice deciding whether it agrees with the tap.
+  ['mode — after tap', ui.buildModeCard('max', ui.modeNotice('max', 'max'))],
+  ['mode — the write did not land', ui.buildModeCard('balanced', ui.modeNotice('balanced', 'max'))],
   ['brand prompt', ui.UI.brandPrompt],
   ...['auth', 'rate', 'upstream', 'cart', 'unknown'].map(
     (kind) => [`error — ${kind}`, ui.buildErrorText(kind)] as [string, string],
@@ -453,6 +486,7 @@ const ENTRY_POINTS: Array<[string, unknown]> = [
   ),
   ...['connect:', 'optimize:', 'cart:', 'settings:', 'about:', 'home:', 'brands:', 'bradd:', 'brx:2', 'sizes:', 'sizes:max',
     'apply:abc123', 'details:abc123', 'cancel:abc123', 't:abc123:4', 'logout:ask', 'logout:yes', 'logout:no',
+    'alt:abc123:0', 'alt:abc123', 'altpick:abc123:0:1',
   ].map((data) => [`button ${data}`, tap(data)] as [string, unknown]),
   ['reply to the brand prompt', message('Яготинське', { reply_to_message: { text: ui.BRAND_PROMPT_MARKER + '\n\nНаприклад: Яготинське' } })],
 ];
@@ -470,6 +504,39 @@ for (const [label, update] of ENTRY_POINTS) {
   }
 }
 if (!unrouted) pass(`${ENTRY_POINTS.length} entry points all reach a wired branch`);
+
+/* `screenRequests` decides between editing the screen in place and posting a new
+   one by looking at `ctx.callbackQueryId`. A context that misspells the field is
+   not an error anywhere — it is simply absent, and the screen silently starts
+   sending instead of editing, unanswered. `Update Size` did this for three
+   commits: tapping a mode looked like nothing happening at all. */
+// The definition itself rides along inside the inlined UI module in every node,
+// so only call sites count — anything but `function screenRequests(`.
+const screenNodes = workflow.nodes.filter((n) =>
+  (n.parameters.jsCode ?? '').replace('function screenRequests(', '').includes('screenRequests('));
+for (const node of screenNodes) {
+  if (!(node.parameters.jsCode ?? '').includes('callbackQueryId:')) {
+    fail(`${node.name}: builds a screen context without callbackQueryId — it will send instead of edit`);
+  }
+}
+pass(`${screenNodes.length} nodes draw a screen, all pass callbackQueryId through`);
+
+/* A leaked plan id must never be enough to read or change somebody else's plan.
+   Every node that opens `plan_json` therefore checks the tapper against
+   `telegram_user_id` — the same boundary for the alternatives screens as for
+   toggle, details and apply. */
+const planReaders = workflow.nodes.filter((n) => {
+  const jsCode = n.parameters.jsCode ?? '';
+  // `Apply Changes` reads the row `Validate Plan` already vetted, and vetting it
+  // there rather than here is deliberate — it runs before the plan is claimed.
+  return jsCode.includes('plan_json') && !jsCode.includes("$('Validate Plan')");
+});
+for (const node of planReaders) {
+  if (!(node.parameters.jsCode ?? '').includes('telegram_user_id')) {
+    fail(`${node.name}: reads a stored plan without checking who owns it`);
+  }
+}
+pass(`${planReaders.length} nodes read a stored plan, all check ownership`);
 
 /* One intent, one branch. Wiring an action to two branches sends the screen
    twice — /blocked did exactly that once. */

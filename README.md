@@ -62,10 +62,14 @@ flowchart TD
 5. The card lists each replacement with a checkbox — untick anything you want to
    keep, and the totals recalculate in place. Brands you never want offered go on
    a blocklist with `/block`.
-6. If the cart reveals the chosen product is the wrong pack size or out of stock,
+6. Every line that has confirmed runners-up carries **«Інші варіанти»**: the run
+   keeps up to two beside the pick it made, and choosing one swaps it in as an
+   ordinary replacement — the saving and the headline follow, the checkbox does
+   not move, and nothing is searched or judged again.
+7. If the cart reveals the chosen product is the wrong pack size or out of stock,
    the next-best candidate goes in instead — sizes are invisible until an item is
    in the cart.
-7. **Nothing is written until the guest taps ✅.** Afterwards the cart is re-read
+8. **Nothing is written until the guest taps ✅.** Afterwards the cart is re-read
    and the reported saving is the actual difference, not the prediction — closed
    with a wish, the way Silpo closes a till receipt.
 

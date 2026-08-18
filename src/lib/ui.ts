@@ -204,6 +204,22 @@ export interface Card {
   keyboard: Keyboard;
 }
 
+/**
+ * A runner-up as the card sees it: a name, a price and enough of a verdict to
+ * put it on a screen. Structurally the plan's `Alternate`, restated here because
+ * this file deliberately imports nothing.
+ */
+interface Alternate {
+  name: string;
+  slug?: string | null;
+  price: number;
+  /** Produced by `computeSaving` when the run confirmed it — never recomputed here. */
+  saving: number;
+  reason?: string | null;
+  /** Below the mode's `minConfidence`: kept for apply-time fallback, never offered. */
+  offerable?: boolean;
+}
+
 interface Replacement {
   originalName: string;
   replacementName: string;
@@ -225,6 +241,8 @@ interface Replacement {
   aiReason?: string | null;
   /** At or above the engine's confidence bar: ticked when the card is drawn. */
   confident?: boolean;
+  /** Runners-up the guest may switch to. Absent on plans stored before they were offered. */
+  alternates?: Alternate[];
 }
 
 interface PlanSummary {
@@ -335,6 +353,17 @@ export const UI = {
   planStale: '⏳ План застарів — ціни могли змінитися.\n\nЗапустіть /optimize ще раз.',
 
   /**
+   * The two ways a tap on a runner-up can arrive at nothing.
+   *
+   * Both are stale-keyboard cases: the card was redrawn, or this line was
+   * already switched to the very product being tapped. They print as a notice on
+   * the same screen rather than as a toast, so the guest sees the list they can
+   * still choose from underneath the sentence.
+   */
+  alternateGone: 'Цього варіанта вже немає у списку — оберіть інший.',
+  alternateNoSaving: 'Цей варіант уже не дешевший за поточну ціну — оберіть інший.',
+
+  /**
    * Apply, with every box unticked.
    *
    * It used to be nearly unreachable, because the card opened with everything
@@ -374,6 +403,7 @@ export const BUTTON = {
   about: 'Як це працює',
   disconnect: 'Від’єднати акаунт',
   back: '‹ Назад',
+  alternates: '🔄 Інші варіанти',
   details: 'Деталі',
   apply: 'Застосувати',
   cancel: 'Скасувати',
@@ -533,6 +563,23 @@ function modeKey(value?: string | null): string {
 export function modeLabel(mode?: string | null): string {
   const found = MODE_OPTIONS.find((o) => o.key === modeKey(mode));
   return found ? found.label.toLowerCase() : 'збалансований';
+}
+
+/**
+ * What the mode screen says after a tap — decided by the row that was read back,
+ * never by the tap itself.
+ *
+ * The screen used to be drawn from the choice the guest had just made, on the
+ * reasoning that the write was about to happen in the next node. That reasoning
+ * held right up until a write stopped landing: the card then confirmed a setting
+ * the table did not have, and the guest only found out on the next visit to
+ * Settings, where the old mode was still sitting. Working rule 6 says it for the
+ * cart and it is no different here — re-read, and report what is actually there.
+ */
+export function modeNotice(stored: string | null | undefined, requested: string): string {
+  return modeKey(stored) === modeKey(requested)
+    ? 'Збережено: ' + modeLabel(requested)
+    : 'Не вдалося зберегти — режим лишився «' + modeLabel(stored) + '». Спробуйте ще раз.';
 }
 
 export function buildModeCard(mode?: string | null, notice?: string): Card {
@@ -904,14 +951,19 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   // screen starts looking like a toy.
   const legend = replacements.some((r) => !r.confident)
     ? '✅ — впевнений, що це та сама покупка\n' +
-      '☐ — тут вирішувати вам: подивіться, що я написав під ціною\n'
+      '☐ — тут вирішувати вам: подивіться, що я написав під ціною\n\n'
     : '';
 
+  // Three things, not one paragraph: what the buttons do, what the two glyphs
+  // mean, what to press when you are finished. Run together they were four
+  // consecutive lines of instruction under four consecutive lines of statistics,
+  // and the eye had nothing to hold on to — the blank lines are what make the
+  // legend read as a legend rather than as two more sentences.
   const footer =
     RULE + '\n' +
     statsLines(plan.summary, replacements.length, plan.mode).join('\n') + '\n' +
-    RULE + '\n' +
-    'ℹ️ Кнопки під повідомленням вмикають і вимикають заміни.\n' +
+    RULE + '\n\n' +
+    'ℹ️ Кнопки під повідомленням вмикають і вимикають заміни.\n\n' +
     legend +
     'Натисніть ' + b('«Застосувати»') + ', коли позначите потрібне.\n';
 
@@ -977,18 +1029,132 @@ export function buildSelectionCard(plan: Plan, selected: number[]): Card {
   // where it read as part of the saving rather than as something separate.
   if (notes.length) text += '\n' + notes.join('\n\n');
 
-  const keyboard: Keyboard = replacements.map((r, i) => [
-    {
-      text: (selected.indexOf(i) !== -1 ? ON : OFF) + ' ' + (i + 1) + '. ' + trim(r.originalName, 26),
-      callback_data: 't:' + plan.planId + ':' + i,
-    },
-  ]);
+  // One row per replacement, and the second button on it is deliberate: a row of
+  // its own would double the keyboard on a sixteen-line card, and a single
+  // global «показати альтернативи» would open a list of everything with no way
+  // to tell which product it belonged to. Beside the checkbox it inherits the
+  // row's subject, which is the product named on the same line.
+  //
+  // It appears only where there is something behind it — a button that opens an
+  // empty screen is worse than no button.
+  const keyboard: Keyboard = replacements.map((r, i) => {
+    const row: Button[] = [
+      {
+        text: (selected.indexOf(i) !== -1 ? ON : OFF) + ' ' + (i + 1) + '. ' + trim(r.originalName, 26),
+        callback_data: 't:' + plan.planId + ':' + i,
+      },
+    ];
+    if (offerableAlternates(r).length) {
+      row.push({ text: BUTTON.alternates, callback_data: 'alt:' + plan.planId + ':' + i });
+    }
+    return row;
+  });
 
   keyboard.push([
     { text: BUTTON.apply + ' · ' + chosen.length, callback_data: 'apply:' + plan.planId },
     { text: BUTTON.details, callback_data: 'details:' + plan.planId },
   ]);
   keyboard.push([{ text: BUTTON.cancel, callback_data: 'cancel:' + plan.planId }]);
+
+  return { text, keyboard };
+}
+
+/**
+ * The runners-up this guest may actually be shown.
+ *
+ * `alternates` is the complete, ranked list the run confirmed, and apply-time
+ * fallback needs all of it. What may be *offered* is narrower: working rule 3d
+ * says a candidate below `minConfidence` is not put in front of anybody, and the
+ * engine marks that with `offerable` where the confidence bars live. A plan
+ * stored before the field existed carries none, and those are shown — they were
+ * confirmed by the same pipeline.
+ */
+function offerableAlternates(replacement: Replacement): Alternate[] {
+  return (replacement.alternates || []).filter((a) => a && a.offerable !== false);
+}
+
+/* ------------------------------------------------------- alternatives view */
+
+/**
+ * One line's runners-up, and nothing else on the screen.
+ *
+ * The card stays a list of decisions; this is the one place a guest is comparing
+ * products, so it can afford three lines each — the original for reference, what
+ * is chosen now, and what else there is. Everything on it was already confirmed
+ * during the run: no search runs, no model is called, nothing is recomputed.
+ *
+ * The rhythm rule from the card applies here too — every option is exactly two
+ * lines plus an optional reason, so two prices sit in the same column.
+ */
+export function buildAlternativesCard(
+  plan: Plan,
+  index: number,
+  notice?: string,
+): Card {
+  const replacements = plan.replacements || [];
+  const replacement = replacements[index];
+  const back: Keyboard = [[{ text: BUTTON.back, callback_data: 'alt:' + plan.planId }]];
+
+  // A stale keyboard from a card that has since been redrawn. Say so plainly and
+  // give the way back rather than an empty screen.
+  if (!replacement) {
+    return { text: '🔄 <b>Інші варіанти</b>\n\nЦя заміна вже не в плані — поверніться до списку.', keyboard: back };
+  }
+
+  // Cheapest first, defensively. The stored order is the run's ranking, and the
+  // head of it is whatever was demoted the last time the guest switched this
+  // line — which is a judgement about quality, not about price. A guest reading
+  // a short list of prices expects them to descend from the best deal.
+  // Display only: `alternates` keeps its ranking, because apply-time fallback
+  // reads that order and the buttons carry each option's index in it.
+  const options = offerableAlternates(replacement).slice().sort((a, b) => a.price - b.price);
+
+  let text = '🔄 <b>Інші варіанти</b>\n' + RULE + '\n\n';
+  if (notice) text += i(esc(notice)) + '\n\n';
+
+  text +=
+    productLink(replacement.originalName, { slug: replacement.originalSlug }) + '\n' +
+    s(money(replacement.originalPrice)) +
+    (replacement.quantity && replacement.quantity > 1 ? ' × ' + replacement.quantity : '') + '\n\n' +
+    'Зараз обрано:\n' +
+    productLink(replacement.replacementName, { slug: replacement.replacementSlug }) + '\n' +
+    b(money(replacement.replacementPrice)) + ' · економія ' + money(replacement.saving) + '\n';
+
+  if (!options.length) {
+    text += '\n' + RULE + '\n\nІнших підтверджених варіантів для цієї позиції немає.';
+    return { text, keyboard: back };
+  }
+
+  text += '\n' + RULE + '\n\nІнші варіанти:\n\n';
+
+  // Clipped against one list with the two names above them: a runner-up is
+  // usually the same product from another brand, so the words that tell them
+  // apart sit past any sensible cut and two rows come out identical.
+  const clipped = clipAll(
+    [replacement.originalName, replacement.replacementName].concat(options.map((a) => a.name)),
+    34,
+  );
+
+  options.forEach((option, position) => {
+    // The figure is the one `computeSaving` produced when the run confirmed this
+    // candidate, and it is the same figure `applyAlternate` will recompute from
+    // the same two prices if it is picked. Nothing is multiplied on this screen.
+    text +=
+      b(position + 1 + '.') + ' ' + linkTo(clipped[position + 2], getProductUrl(option)) + '\n' +
+      b(money(option.price)) + ' · економія ' + money(option.saving) + '\n';
+    if (option.reason) text += '💬 ' + i(esc(option.reason)) + '\n';
+    text += '\n';
+  });
+
+  text += RULE + '\nОберіть варіант кнопкою нижче — заміна оновиться у списку.';
+
+  const keyboard: Keyboard = options.map((option, position) => [
+    {
+      text: position + 1 + '. ' + trim(option.name, 24) + ' · ' + money(option.price),
+      callback_data: 'altpick:' + plan.planId + ':' + index + ':' + (replacement.alternates || []).indexOf(option),
+    },
+  ]);
+  keyboard.push(back[0]);
 
   return { text, keyboard };
 }

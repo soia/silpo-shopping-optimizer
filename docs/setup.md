@@ -75,9 +75,15 @@ TTL checks use `createdAt`.
 >   `conservative` / `balanced` / `max`. The column keeps its old name because
 >   it already holds the three pack-size presets (`strict` / `normal` /
 >   `loose`) that modes replaced, and `resolveMode()` folds those onto the mode
->   carrying the same band — so nothing needs migrating. Absent or unrecognised
->   reads as `balanced`, so the bot keeps working without the column; only the
->   setting silently stops persisting.
+>   carrying the same band — so nothing needs migrating. An unrecognised value
+>   reads as `balanced`.
+>
+>   **A table created before modes existed does not have this column, and adding
+>   it to the workflow does not create it.** Reading tolerates its absence;
+>   writing does not — the Data Table node throws `unknown column name` and then
+>   swallows the error, so tapping a mode confirms itself and saves nothing.
+>   Measured on a live table: `Add Column` → `size_tolerance` → **String** fixes
+>   it, and the table id does not change.
 
 > Table ids and the instance URL are compiled into the workflows. Put yours in
 > **`.secrets/n8n.json`** (gitignored) and rebuild:

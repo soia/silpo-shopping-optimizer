@@ -661,6 +661,10 @@ for (const item of $input.all()) {
   let planId = null;
 
   let toggleIndex = null;
+  // Which replacement's runners-up, and which of them was tapped. Indices only:
+  // callback_data is capped at 64 bytes, and the plan already holds the rest.
+  let altIndex = null;
+  let altChoice = null;
   let sizeChoice = '';
   let brandArg = null;
   let brandIndex = null;
@@ -671,11 +675,24 @@ for (const item of $input.all()) {
 
   if (callbackData) {
     // apply:<planId> | details:<planId> | cancel:<planId> | t:<planId>:<index>
+    // | alt:<planId>[:<index>] | altpick:<planId>:<index>:<alternate>
     // | logout:yes | brx:<index> | home: | settings: | brands: | bradd: | about:
     const parts = callbackData.split(':');
     action = parts[0] === 't' ? 'toggle' : parts[0];
     planId = parts[1] || null;
     if (action === 'toggle') toggleIndex = Number(parts[2]);
+    if (action === 'alt') {
+      // With an index it opens that line's runners-up; without one it is the
+      // «Назад» button on that screen, which redraws the card. One branch, two
+      // directions - the screen it lands on is the only difference.
+      action = 'alternates';
+      altIndex = parts[2] === undefined || parts[2] === '' ? null : Number(parts[2]);
+    }
+    if (action === 'altpick') {
+      action = 'altPick';
+      altIndex = Number(parts[2]);
+      altChoice = Number(parts[3]);
+    }
     if (action === 'brx') {
       action = 'brandRemove';
       planId = null;
@@ -719,6 +736,8 @@ for (const item of $input.all()) {
     action,
     planId,
     toggleIndex,
+    altIndex,
+    altChoice,
     sizeChoice,
     brandArg,
     brandIndex,
@@ -754,7 +773,16 @@ return items;
       `
 ${READ_VAR}
 ${TELEGRAM_API}
-const SELF_ACKING = ['home', 'settings', 'about', 'blocked', 'block', 'unblock', 'brandAdd', 'brandRemove', 'sizes', 'sizeSet'];
+// These screens answer their own callback because they carry a toast, and
+// Telegram accepts one answer per query.
+//
+// 'sizeSet' used to be on this list and no longer is. Its answer was produced by
+// Update Size but *dispatched* by Send Size - at the end of a chain that goes
+// through a Data Table write first - so anything failing in between left the
+// button spinning for thirty seconds with no explanation, which is the exact
+// behaviour working rule 11 exists to prevent. The confirmation it used to toast
+// now rides on the redrawn card instead, where a failed write cannot swallow it.
+const SELF_ACKING = ['home', 'settings', 'about', 'blocked', 'block', 'unblock', 'brandAdd', 'brandRemove', 'sizes'];
 
 return $input.all()
   .filter(i => i.json.callbackQueryId && SELF_ACKING.indexOf(i.json.action) === -1)
@@ -859,6 +887,8 @@ return routed.map(r => {
             // Only the fallback index moves, and the validator checks it.
             { conditions: stringCondition('sizes'), outputKey: 'sizes' },
             { conditions: stringCondition('sizeSet'), outputKey: 'sizeSet' },
+            { conditions: stringCondition('alternates'), outputKey: 'alternates' },
+            { conditions: stringCondition('altPick'), outputKey: 'altPick' },
           ],
         },
         options: { fallbackOutput: 'extra', renameFallbackOutput: 'other' },
@@ -1254,6 +1284,11 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
     reason: best.reason,
     confidence: best.confidence,
   });
+  // The runner-up now has two readers: apply-time fallback, which takes whatever
+  // is next in the list, and the guest, who can pick one by hand off the «Інші
+  // варіанти» screen. The second reader is why the model's verdict travels with
+  // it - a candidate the guest chooses must be able to say why it is here, in
+  // words written about itself.
   best.candidate.alternates = confirmed.slice(1).map(o => ({
     productId: o.candidate.id,
     companyId: o.candidate.companyId,
@@ -1265,6 +1300,15 @@ const bestResults = await mapLimit(items, SILPO_CONCURRENCY, async (item, i) => 
     price: o.candidate.price,
     saving: o.saving,
     brand: o.candidate.brand || null,
+    reason: o.reason,
+    // Both bars resolved here, where the mode is known. The card is redrawn from
+    // a stored row that has no idea which mode produced it, and the alternatives
+    // screen is drawn from the same row.
+    confident: o.confidence >= confidentAt(input.sizeTolerance),
+    // Working rule 3d: below minConfidence a candidate is not offered at all.
+    // It stays in the array - apply-time fallback may still need it when the
+    // cart contradicts everything above it - but no button is drawn for it.
+    offerable: o.confidence >= minConfidence(input.sizeTolerance),
   }));
   return { candidate: best.candidate, selection: enrichedSelection };
 });
@@ -1574,18 +1618,15 @@ const route = $('Merge Session').first().json;
 const allowed = MODE_OPTIONS.map(o => o.key);
 const choice = allowed.indexOf(String(route.sizeChoice || '')) !== -1 ? route.sizeChoice : 'balanced';
 
-const ctx = { chatId: route.chatId, messageId: route.messageId, callbackId: route.callbackId };
-// The screen is redrawn from the choice rather than from the row: the write
-// happens in the next node, and drawing the old value would show the guest a
-// setting they did not pick.
-const requests = screenRequests(buildModeCard(choice), ctx, 'Збережено: ' + modeLabel(choice));
-
-return requests.map(r => ({ json: {
+// Nothing is drawn here any more. The screen is built after the write, from the
+// row the table hands back - see Confirm Size.
+return [{ json: {
   telegramUserId: route.telegramUserId,
+  chatId: route.chatId,
+  messageId: route.messageId,
+  callbackQueryId: route.callbackQueryId,
   sizeValue: choice,
-  url: telegramApiUrl(r.method),
-  body: r.body,
-}}));
+}}];
 `,
       { x: 520, y: 1420 },
     ),
@@ -1598,26 +1639,71 @@ return requests.map(r => ({ json: {
       {
         operation: 'update',
         table: TABLES.sessions,
-        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Update Size').first().json.telegramUserId }}" }],
-        columns: { size_tolerance: "={{ $('Update Size').first().json.sizeValue }}" },
+        // $json because this node's input *is* Update Size's output, so the id
+        // is on the item in front of it. That is the whole test - not a
+        // preference. Where the input is something else, name the node instead
+        // (Clear Session, below).
+        filters: [{ keyName: 'telegram_user_id', keyValue: '={{ $json.telegramUserId }}' }],
+        columns: { size_tolerance: '={{ $json.sizeValue }}' },
       },
-      // Same reasons as Save Blocklist: a guest with no session row must still
-      // get a reply, and the write must happen once rather than once per API call.
-      { x: 740, y: 1420, alwaysOutputData: true, executeOnce: true },
+      // No onError here, and that is the fix rather than an omission.
+      //
+      // The Data Table node catches its own exceptions whenever continueOnFail()
+      // is true - and that is true for BOTH continueRegularOutput and
+      // continueErrorOutput. Its router then pushes the node's own *input* item
+      // into the regular output, attaching the error only when it is a
+      // NodeApiError or a NodeOperationError. A table error is neither, so
+      // wiring an error output here did not surface the failure: it buried it,
+      // and the branch carried on drawing a screen from an item that had never
+      // been near the table. The error output could never fire.
+      //
+      // continueRegularOutput is therefore not error handling here - it is the
+      // only way to keep the branch alive past a failed write, and what it
+      // yields is the input item, which Confirm Size recognises as "the table
+      // was never touched". Left to throw instead, the whole branch dies and the
+      // guest gets no answer at all; the message is only in the execution log
+      // either way, because this node never attaches it to the item.
+      //
+      // executeOnce is gone with the screen-building that used to happen in
+      // Update Size: that node emits exactly one item now, so there is nothing
+      // left to run twice.
+      { x: 740, y: 1420, alwaysOutputData: true, onError: 'continueRegularOutput' },
     ),
   );
   link('Update Size', 'Save Size');
 
   nodes.push(
     codeNode(
-      'Size Screen Requests',
+      'Confirm Size',
       `
-return $('Update Size').all().map(i => ({ json: { url: i.json.url, body: i.json.body } }));
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
+const tap = $('Update Size').first().json;
+// The Data Table update returns the rows it actually changed - not a count, the
+// rows themselves - so the state after the write needs no second read. An update
+// that matched nothing returns none of them, and alwaysOutputData turns that
+// into one empty item, which is exactly the case worth telling the guest about.
+const row = $input.all().map(i => i.json).find(r => r && r.telegram_user_id !== undefined);
+// null is what modeNotice reads as "the table does not have it" - and a row that
+// came back without the column reads the same way, because as far as the engine
+// is concerned the setting is not stored either way.
+const stored = row ? row.size_tolerance : null;
+
+const ctx = { chatId: tap.chatId, messageId: tap.messageId, callbackQueryId: tap.callbackQueryId };
+// Drawn from the stored value, so the radio can never mark a mode the engine
+// will not use. The tap only decides what the notice compares against.
+const requests = screenRequests(buildModeCard(stored, modeNotice(stored, tap.sizeValue)), ctx)
+  // This branch does not answer its own callback - Build Ack does, the moment
+  // the tap arrives, so no failure downstream can leave the button spinning.
+  .filter(r => r.method !== 'answerCallbackQuery');
+
+return requests.map(r => ({ json: { url: telegramApiUrl(r.method), body: r.body } }));
 `,
       { x: 960, y: 1420 },
     ),
   );
-  link('Save Size', 'Size Screen Requests');
+  link('Save Size', 'Confirm Size');
 
   nodes.push(
     makeNode(
@@ -1631,10 +1717,10 @@ return $('Update Size').all().map(i => ({ json: { url: i.json.url, body: i.json.
         jsonBody: '={{ JSON.stringify($json.body) }}',
         options: {},
       },
-      { typeVersion: 4.2, x: 1180, y: 1420 },
+      { typeVersion: 4.2, x: 1400, y: 1420 },
     ),
   );
-  link('Size Screen Requests', 'Send Size');
+  link('Confirm Size', 'Send Size');
 
   nodes.push(
     dataTableNode(
@@ -1642,8 +1728,9 @@ return $('Update Size').all().map(i => ({ json: { url: i.json.url, body: i.json.
       {
         operation: 'update',
         table: TABLES.sessions,
-        filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Update Blocklist').first().json.telegramUserId }}" }],
-        columns: { blocked_brands: "={{ $('Update Blocklist').first().json.blockedValue }}" },
+        // Same test as Save Size: this node's input is Update Blocklist's output.
+        filters: [{ keyName: 'telegram_user_id', keyValue: '={{ $json.telegramUserId }}' }],
+        columns: { blocked_brands: '={{ $json.blockedValue }}' },
       },
       // Same trap as the logout branch: a guest who never connected has no
       // session row, so the update touches nothing and the reply would be lost.
@@ -1776,6 +1863,13 @@ return [{ json: { ...base, confirmed: false, url: telegramApiUrl('sendMessage'),
       {
         operation: 'update',
         table: TABLES.sessions,
+        // Named rather than $json, and this is the exception that proves the
+        // rule: this node's input is not Prepare Logout's item, it is the
+        // Telegram API response from Send Logout Reply. $json.telegramUserId is
+        // undefined there, the filter matches no row, and the Data Table node
+        // calls that a success - logout then confirmed itself while leaving the
+        // tokens in place. The IF node beside it reads the same node for the
+        // same reason.
         filters: [{ keyName: 'telegram_user_id', keyValue: "={{ $('Prepare Logout').first().json.telegramUserId }}" }],
         columns: { access_token_enc: '', refresh_token_enc: '', client_id: '', expires_at: '' },
       },
@@ -1908,6 +2002,179 @@ return [{ json: {
     ),
   );
   link('Save Selection', 'Update Card');
+
+  /* --- alternatives branch: switch one line to a runner-up ------------- */
+  //
+  // Nothing here searches, judges or recomputes anything the run did not already
+  // confirm. Both screens are drawn from the stored plan, and the pick is a swap
+  // inside it: `applyAlternate` puts the chosen product in the primary slot and
+  // the previous primary at the head of `alternates`, so the guest can change
+  // their mind again for one more tap and apply keeps a fallback that already
+  // cleared every check.
+  nodes.push(
+    dataTableNode(
+      'Load Plan For Alternates',
+      { operation: 'get', table: TABLES.plans, filters: [{ keyName: 'plan_id', keyValue: '={{ $json.planId }}' }] },
+      { x: 520, y: 1600, alwaysOutputData: true },
+    ),
+  );
+  link('Switch Action', 'Load Plan For Alternates', 18);
+
+  nodes.push(
+    codeNode(
+      'Show Alternatives',
+      `
+${READ_VAR}
+${TELEGRAM_API}
+${UI_MODULE}
+const route = $('Merge Session').first().json;
+const rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);
+const row = rows.find(r => String(r.plan_id) === String(route.planId));
+
+// Same ownership boundary as every other branch that touches a plan.
+if (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {
+  return [{ json: { url: telegramApiUrl('answerCallbackQuery'), body: {
+    callback_query_id: route.callbackQueryId,
+    text: UI.planGone,
+  }}}];
+}
+
+const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
+plan.planId = row.plan_id;
+const selected = Array.isArray(plan.selected) ? plan.selected : (plan.replacements || []).map((r, i) => i);
+
+// «Інші варіанти» carries the line index; «Назад» carries none and redraws the
+// card the guest came from - same message, same ticks, nothing re-run.
+const card = route.altIndex == null
+  ? buildSelectionCard(plan, selected)
+  : buildAlternativesCard(plan, Number(route.altIndex));
+
+const body = message(route.chatId, card.text, { message_id: route.messageId });
+if (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };
+
+return [{ json: { url: telegramApiUrl('editMessageText'), body }}];
+`,
+      { x: 740, y: 1600 },
+    ),
+  );
+  link('Load Plan For Alternates', 'Show Alternatives');
+
+  // Edited in place, like the toggle: opening and closing a list of runners-up
+  // must not leave a trail of dead menus in the chat.
+  nodes.push(
+    makeNode(
+      'Show Alt Screen',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: "={{ $('Show Alternatives').first().json.url }}",
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: "={{ JSON.stringify($('Show Alternatives').first().json.body) }}",
+        options: {},
+      },
+      { typeVersion: 4.2, x: 960, y: 1600, onError: 'continueRegularOutput' },
+    ),
+  );
+  link('Show Alternatives', 'Show Alt Screen');
+
+  nodes.push(
+    dataTableNode(
+      'Load Plan For Pick',
+      { operation: 'get', table: TABLES.plans, filters: [{ keyName: 'plan_id', keyValue: '={{ $json.planId }}' }] },
+      { x: 520, y: 1760, alwaysOutputData: true },
+    ),
+  );
+  link('Switch Action', 'Load Plan For Pick', 19);
+
+  nodes.push(
+    codeNode(
+      'Pick Alternate',
+      `
+${READ_VAR}
+${AI_RANKER}
+${TELEGRAM_API}
+${UI_MODULE}
+const route = $('Merge Session').first().json;
+const rows = $input.all().map(i => i.json).filter(r => r && r.plan_id);
+const row = rows.find(r => String(r.plan_id) === String(route.planId));
+
+if (!row || String(row.telegram_user_id) !== String(route.telegramUserId) || row.status !== 'pending') {
+  return [{ json: { skip: true, url: telegramApiUrl('answerCallbackQuery'), body: {
+    callback_query_id: route.callbackQueryId,
+    text: UI.planGone,
+  }}}];
+}
+
+const plan = typeof row.plan_json === 'string' ? JSON.parse(row.plan_json) : row.plan_json;
+plan.planId = row.plan_id;
+const index = Number(route.altIndex);
+const selected = Array.isArray(plan.selected) ? plan.selected : (plan.replacements || []).map((r, i) => i);
+
+// The swap and every figure it changes. The ticks are not touched: a guest who
+// had this line on keeps it on, and one who had it off keeps it off - they chose
+// a product, not whether to buy it.
+const result = applyAlternate(plan, index, Number(route.altChoice));
+
+// A tap that arrives at nothing is a keyboard from before a redraw. The guest
+// stays on the list they were looking at, with a line saying what happened,
+// rather than being bounced to a screen they did not ask for.
+const card = result.ok
+  ? buildSelectionCard(plan, selected)
+  : buildAlternativesCard(plan, index,
+      result.reason === 'no-saving' ? UI.alternateNoSaving : UI.alternateGone);
+
+const body = message(route.chatId, card.text, { message_id: route.messageId });
+if (card.keyboard.length) body.reply_markup = { inline_keyboard: card.keyboard };
+
+return [{ json: {
+  skip: false,
+  planId: row.plan_id,
+  // Written back on the failed path too, and deliberately: applyAlternate leaves
+  // the plan untouched when it refuses, so this stores the same bytes it read.
+  planJson: JSON.stringify(plan),
+  url: telegramApiUrl('editMessageText'),
+  body,
+}}];
+`,
+      { x: 740, y: 1760 },
+    ),
+  );
+  link('Load Plan For Pick', 'Pick Alternate');
+
+  // The card, the stored row and the apply step have to agree about which
+  // product this line is now, so the swap is persisted before the screen that
+  // shows it goes out.
+  nodes.push(
+    dataTableNode(
+      'Save Alternate',
+      {
+        operation: 'update',
+        table: TABLES.plans,
+        filters: [{ keyName: 'plan_id', keyValue: '={{ $json.planId }}' }],
+        columns: { plan_json: '={{ $json.planJson }}' },
+      },
+      { x: 960, y: 1760 },
+    ),
+  );
+  link('Pick Alternate', 'Save Alternate');
+
+  nodes.push(
+    makeNode(
+      'Update Picked Card',
+      'n8n-nodes-base.httpRequest',
+      {
+        method: 'POST',
+        url: "={{ $('Pick Alternate').first().json.url }}",
+        sendBody: true,
+        specifyBody: 'json',
+        jsonBody: "={{ JSON.stringify($('Pick Alternate').first().json.body) }}",
+        options: {},
+      },
+      { typeVersion: 4.2, x: 1180, y: 1760, onError: 'continueRegularOutput' },
+    ),
+  );
+  link('Save Alternate', 'Update Picked Card');
 
   /* --- apply branch: the only place that writes ----------------------- */
   nodes.push(
@@ -2400,7 +2667,7 @@ return screenRequests(card, ctx).map(r => ({ json: { url: telegramApiUrl(r.metho
   // /start and anything unrecognised land on home. The fallback output sits
   // after every rule, so its index shifts whenever a rule is added.
   link('Switch Action', 'Build Home', 15);
-  link('Switch Action', 'Build Home', 18);
+  link('Switch Action', 'Build Home', 20);
   link('Switch Action', 'Build Settings', 11);
   link('Switch Action', 'Show Sizes', 16);
   link('Switch Action', 'Build About', 12);

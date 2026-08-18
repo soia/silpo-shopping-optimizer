@@ -51,7 +51,7 @@ export {
 
 export { confidentAt, minConfidence } from './confidence.ts';
 
-export { buildPlan, computeSaving } from './plan-builder.ts';
+export { buildPlan, computeSaving, applyAlternate } from './plan-builder.ts';
 
 export type { Mode, SizeTolerance } from './optimization-modes.ts';
 

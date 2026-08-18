@@ -26,6 +26,7 @@ import {
   fatPercent,
   computeSaving,
   buildPlan,
+  applyAlternate,
   sizeBand,
   minConfidence,
   confidentAt,
@@ -39,6 +40,7 @@ import {
 import {
   defaultSelection,
   buildSelectionCard,
+  buildAlternativesCard,
   buildCartCard,
   buildDetailsCard,
   buildResultText,
@@ -713,4 +715,214 @@ test('no message invites Telegram to paste a product preview under it', () => {
   }
   // A caller may still override it deliberately; nothing does today.
   assert.equal(message(1, 'текст', { link_preview_options: null }).link_preview_options, null);
+});
+
+/* ------------------------------------------- picking a runner-up by hand */
+
+/**
+ * The guest's own choice among the runners-up.
+ *
+ * Everything below is offline on purpose: the run already confirmed each of
+ * these candidates against `get_product_details`, and picking one is a swap
+ * inside the stored plan — no search, no model call, no new plan. What has to be
+ * pinned down is that the swap is *complete*: after it, the picked product is an
+ * ordinary replacement, its figures are recomputed from the two prices, and the
+ * ticks the guest set are untouched.
+ */
+
+function alternate(over: Partial<import('./types.ts').Alternate> = {}) {
+  return {
+    productId: 'a1', companyId: 'c1', branchId: 'b1',
+    name: 'Масло «Ферма» 82%', slug: 'maslo-ferma-82-111222',
+    price: 95, saving: 25, brand: 'Ферма',
+    reason: 'Те саме масло 82%, інша марка', confident: true, offerable: true,
+    ...over,
+  };
+}
+
+function butterPlan() {
+  return {
+    planId: 'plan1',
+    selected: [0],
+    summary: { originalTotal: 500, saving: 80 },
+    replacements: [
+      {
+        originalProductId: 'o1', originalName: 'Масло «Президент» 82%', originalSlug: 'maslo-prezydent-82-111000',
+        originalPrice: 120, originalRatio: '180г', quantity: 1,
+        replacementProductId: 'p1', replacementCompanyId: 'c1', replacementBranchId: 'b1',
+        replacementName: 'Масло «Яготинське» 82%', replacementSlug: 'maslo-iahotynske-82-111111',
+        replacementPrice: 90, replacementRatio: '180г', onPromotion: false, brand: 'Яготинське',
+        saving: 30, savingPct: 25, verifySize: false, confident: true,
+        aiReason: 'Те саме масло 82%, те саме фасування',
+        alternates: [alternate(), alternate({ productId: 'a2', name: 'Масло «Селянське» 82%', price: 99, saving: 21, slug: null })],
+      },
+      {
+        originalProductId: 'o2', originalName: 'Сир «Президент» 45%', originalSlug: null,
+        originalPrice: 200, originalRatio: '200г', quantity: 1,
+        replacementProductId: 'p2', replacementCompanyId: 'c1', replacementBranchId: 'b1',
+        replacementName: 'Сир «Премія» 45%', replacementSlug: null,
+        replacementPrice: 150, replacementRatio: '200г', onPromotion: false, brand: 'PREMIA',
+        saving: 50, savingPct: 25, verifySize: false, confident: false,
+        aiReason: 'Той самий сир 45%',
+        // Typed rather than bare: an empty literal infers never[], and the union
+        // with the line above it then hides every field from the assertions.
+        alternates: [] as Array<ReturnType<typeof alternate>>,
+      },
+    ],
+  };
+}
+
+test('«Інші варіанти» appears only where there is something behind it', () => {
+  const plan = butterPlan();
+  const rows = buildSelectionCard(plan, [0]).keyboard;
+
+  // Row 0 is the line with two runners-up, row 1 the line with none. The rest
+  // of the keyboard is Apply/Details/Cancel and is not per-replacement.
+  assert.equal(rows[0].length, 2, 'a line with alternates carries the second button');
+  assert.equal(rows[0][1].callback_data, 'alt:plan1:0');
+  assert.equal(rows[1].length, 1, 'a line with none must not offer an empty screen');
+});
+
+test('a runner-up below the confidence bar is never put on a button', () => {
+  // Working rule 3d: under minConfidence it stays in the array for apply-time
+  // fallback and off every screen.
+  const plan = butterPlan();
+  plan.replacements[0].alternates = [alternate({ offerable: false })];
+
+  assert.equal(buildSelectionCard(plan, [0]).keyboard[0].length, 1);
+  const card = buildAlternativesCard(plan, 0);
+  assert.ok(!card.text.includes('Масло «Ферма»'));
+  assert.equal(card.keyboard.length, 1, 'only «Назад» is left');
+});
+
+test('the alternatives screen names one line, cheapest option first', () => {
+  const card = buildAlternativesCard(butterPlan(), 0);
+
+  assert.ok(card.text.includes('Масло «Президент» 82%'), 'the original, for reference');
+  assert.ok(card.text.includes('Масло «Яготинське» 82%'), 'what is chosen right now');
+  assert.ok(card.text.indexOf('Масло «Ферма» 82%') < card.text.indexOf('Масло «Селянське» 82%'));
+  // Name, price and saving for each — the three things the choice is made on.
+  assert.ok(card.text.includes('95,00'));
+  assert.ok(card.text.includes('економія 25,00'));
+  // Two picks and a way back, nothing else.
+  assert.deepEqual(
+    card.keyboard.map((row) => row[0].callback_data),
+    ['altpick:plan1:0:0', 'altpick:plan1:0:1', 'alt:plan1'],
+  );
+  for (const row of card.keyboard) {
+    assert.ok(Buffer.byteLength(row[0].callback_data ?? '') <= 64);
+  }
+});
+
+test('a picked runner-up becomes an ordinary replacement', () => {
+  const plan = butterPlan();
+  assert.equal(applyAlternate(plan, 0, 0).ok, true);
+  const line = plan.replacements[0];
+
+  assert.equal(line.originalName, 'Масло «Президент» 82%', 'the original never moves');
+  assert.equal(line.replacementName, 'Масло «Ферма» 82%');
+  assert.equal(line.replacementProductId, 'a1');
+  assert.equal(line.replacementPrice, 95);
+  // Its own words and its own verdict travel with it — not the demoted pick's.
+  assert.equal(line.aiReason, 'Те саме масло 82%, інша марка');
+  assert.equal(line.brand, 'Ферма');
+});
+
+test('the saving is recomputed from the two prices, per unit and in total', () => {
+  const plan = butterPlan();
+  applyAlternate(plan, 0, 0);
+  assert.equal(plan.replacements[0].saving, 25, '120 − 95, not the 30 it used to be');
+  assert.equal(plan.replacements[0].savingPct, 20.83);
+
+  // Quantity belongs to the line, and the stored figure on the alternate is not
+  // trusted to know it.
+  const two = butterPlan();
+  two.replacements[0].quantity = 2;
+  applyAlternate(two, 0, 0);
+  assert.equal(two.replacements[0].saving, 50);
+});
+
+test('the headline follows the line that changed', () => {
+  const plan = butterPlan();
+  // 30 + 50 on the two lines; the first becomes 25.
+  applyAlternate(plan, 0, 0);
+  assert.equal(plan.summary.saving, 75);
+});
+
+test('switching a product does not switch it on or off', () => {
+  // The guest chose a product, not whether to buy it.
+  const on = butterPlan();
+  applyAlternate(on, 0, 0);
+  assert.deepEqual(on.selected, [0], 'a ticked line stays ticked');
+  assert.ok(buildSelectionCard(on, on.selected).text.includes('✅'));
+
+  const off = butterPlan();
+  off.selected = [1];
+  applyAlternate(off, 0, 0);
+  assert.deepEqual(off.selected, [1], 'an unticked line stays unticked');
+});
+
+test('the demoted pick stays reachable without re-running anything', () => {
+  const plan = butterPlan();
+  applyAlternate(plan, 0, 0);
+  const alternates = plan.replacements[0].alternates ?? [];
+
+  assert.equal(alternates[0].name, 'Масло «Яготинське» 82%', 'the old primary leads the list');
+  assert.equal(alternates[0].price, 90);
+  assert.equal(alternates[0].saving, 30, 'with the figure it was offered at');
+  assert.equal(alternates[0].offerable, true);
+  assert.equal(alternates.length, 2, 'the picked one left the list, nothing else did');
+  assert.ok(!alternates.some((a) => a.productId === 'a1'));
+
+  // And one more tap puts it back, with its own figures.
+  assert.equal(applyAlternate(plan, 0, 0).ok, true);
+  assert.equal(plan.replacements[0].replacementName, 'Масло «Яготинське» 82%');
+  assert.equal(plan.replacements[0].saving, 30);
+  assert.equal(plan.summary.saving, 80);
+});
+
+test('apply reads the guest choice, because there is nothing else left to read', () => {
+  // The apply step builds its queue from replacementProductId/CompanyId/BranchId
+  // and falls back through `alternates`. After a pick, both point at the chosen
+  // product — which is why the swap is done in the plan rather than stored as a
+  // «selectedAlternateIndex» that every reader would have to know about.
+  const plan = butterPlan();
+  applyAlternate(plan, 0, 1);
+  const line = plan.replacements[0];
+
+  assert.equal(line.replacementProductId, 'a2');
+  assert.equal(line.replacementCompanyId, 'c1');
+  assert.equal(line.replacementBranchId, 'b1');
+  assert.equal(line.replacementSlug, null, 'a candidate with no slug renders as plain text');
+  // Pack size was confirmed for the demoted pick, not for this one; apply reads
+  // it from the cart, so inheriting a stale string would be a small lie.
+  assert.equal(line.replacementRatio, null);
+  assert.equal((line.alternates ?? [])[0].productId, 'p1', 'the fallback list is still validated candidates only');
+});
+
+test('a tap that arrives at nothing changes nothing', () => {
+  const gone = butterPlan();
+  assert.deepEqual(applyAlternate(gone, 0, 7), { ok: false, reason: 'no-alternate' });
+  assert.equal(gone.replacements[0].replacementName, 'Масло «Яготинське» 82%');
+  assert.equal(gone.summary.saving, 80);
+
+  assert.equal(applyAlternate(gone, 9, 0).reason, 'no-replacement');
+  // A stale keyboard pointing at something that was never offered.
+  const hidden = butterPlan();
+  hidden.replacements[0].alternates = [alternate({ offerable: false })];
+  assert.equal(applyAlternate(hidden, 0, 0).reason, 'no-alternate');
+
+  // And one that no longer clears the floor every other proposal has to clear.
+  const dear = butterPlan();
+  dear.replacements[0].alternates = [alternate({ price: 119.5, saving: 0.5 })];
+  assert.equal(applyAlternate(dear, 0, 0).reason, 'no-saving');
+  assert.equal(dear.replacements[0].replacementName, 'Масло «Яготинське» 82%');
+});
+
+test('the alternatives screen survives a plan that moved on', () => {
+  // The card was redrawn and this line is gone: a screen with a way back, not a
+  // crash and not an empty message.
+  const card = buildAlternativesCard(butterPlan(), 9);
+  assert.ok(card.text.includes('вже не в плані'));
+  assert.deepEqual(card.keyboard, [[{ text: '‹ Назад', callback_data: 'alt:plan1' }]]);
 });
