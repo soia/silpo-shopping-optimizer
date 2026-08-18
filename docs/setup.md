@@ -120,9 +120,11 @@ re-authorize.
 
 ## 5. Anthropic API key — required
 
-The model is the engine: it picks every replacement and computes every figure.
-There is no rule-based fallback any more, so without a key the bot has nothing
-to propose and the run fails with a plain message.
+The model is the engine: it picks every replacement, judges whether the purchase
+survives and scores its own confidence. It does **not** compute the figures —
+`plan-builder.ts` derives those from MCP prices — but without a key nothing gets
+picked at all, so the bot has nothing to propose and the run fails with a plain
+message. There is no rule-based fallback.
 
 1. [console.anthropic.com](https://console.anthropic.com) → API Keys → Create Key
    (\$5 of credit is plenty for a demo — top the balance up, or every request
@@ -137,9 +139,15 @@ the key travels the same channel as `TELEGRAM_BOT_TOKEN`. There is no
 `AI_SEMANTIC_CHECK` flag left to flip and no `Anthropic API` credential to
 create.
 
-Cost per analysis: one model call per cart line plus one for the totals — 15
-calls on a 14-item cart, at `effort: medium`. Measured on a live 14-item cart:
-**~$0.097 per analysis, roughly 51 runs per \$5** of credit.
+Cost per analysis: **one model call per cart line that survives the gate**, at
+`effort: medium` — so 14 calls on a 14-item cart, and fewer when the gate empties
+a line's pool. Measured on a live 14-item cart: **~\$0.097 per analysis, roughly
+51 runs per \$5** of credit. That measurement predates the removal of the totals
+call, so it counts one call more than a run costs today — the figure is a
+ceiling, not an estimate to round up from.
+
+The receipt wish is one further call, on the apply path only, and costs about
+2% of a run.
 
 The selection system prompt is cached (`cache_control: ephemeral`), which cuts
 ~22% off that. It is 1161 tokens against Sonnet 5's 1024-token minimum, so

@@ -359,7 +359,10 @@ cheapest" in the prompt and raising effort to `medium`. Choosing from 30
 candidates is not the cheap judgement it looked like.
 
 **Cost and latency.** One model call per cart line plus one for totals: 15 calls
-and ~33–49 s per analysis, against 1 call before.
+and ~33–49 s per analysis, against 1 call before. (The totals call was removed
+three sections down, when the arithmetic moved back into code. Every cost figure
+in this section counts it, so all of them are ceilings for the engine as it
+stands.)
 
 ### Arithmetic
 
@@ -681,3 +684,61 @@ reach. It is now the ordinary opening state of a cautious run — and it fell
 through to «Кошик змінився з моменту аналізу», which was untrue about a cart
 nothing had touched. It is rejected in `Validate Plan` instead, **before**
 `Claim Plan`, so the plan stays `pending` and a mistap costs nothing.
+
+---
+
+## 2026-08-18 — the runner-up the guest can take
+
+Selection already asked the model for up to two acceptable alternates beside its
+pick, and they had exactly one reader: the apply step, which reached for the next
+one when the cart refused the first. The guest never saw them, so a card that
+proposed the wrong thing offered no way out except unticking the line.
+
+They are now a screen. Every replacement with confirmed runners-up carries
+«Інші варіанти»; choosing one promotes it to primary and demotes the previous
+pick to the head of that line's alternates, so the swap is reversible in one more
+tap.
+
+### Nothing is judged twice
+
+The tap costs **no MCP call and no model call**. That is only defensible because
+the alternates were confirmed during the original run: `Optimize Cart` walks the
+whole option list through `get_product_details`, applies `rejectReason()` to each
+on its confirmed price, and keeps up to `MAX_OPTIONS` survivors. A runner-up on
+the card has therefore passed the same gate on the same evidence as the pick.
+
+The CLI deliberately does not do this — it stops at the first confirmation,
+because it renders no card and the extra calls would buy nothing.
+
+### The verdict travels with the candidate, not with the slot
+
+The first version had the promoted candidate inherit the primary's `reason` and
+`confidence`. That is code inventing a judgement about a product the model never
+wrote those words about. Before that it was worse: a placeholder string
+(«Запасний варіант, основний виявився недоступним») and a confidence floored at
+0.6, which left a perfectly good kefir unticked and unexplained.
+
+So each alternate carries the model's own `reason` and `confidence` for *itself*,
+returned in the same single call. A promoted runner-up can say why it is there,
+in words written about it.
+
+### What does not move
+
+The checkbox. Promoting a runner-up changes which product the line proposes, not
+whether the guest agreed to it — re-ticking an unticked line on the guest's
+behalf would be the tick bar sliding sideways. `buildPlan()` recomputes the
+saving and the headline from the new candidate's price, as it does for every
+other figure.
+
+`npm test` covers the promotion: the demoted pick lands at the head of
+`alternates` and stays reachable without re-running anything, the saving follows
+the new primary, and a stale tap — a keyboard from before a redraw — is rejected
+rather than applied to whatever now sits at that index. `applyAlternate()` checks
+`offerable` for exactly that reason: an index alone cannot tell the difference
+between a button the guest saw and one the redraw removed. A tap naming a line
+the plan no longer has gets a screen with a way back, not a crash and not an
+empty message.
+
+The figures are recomputed from the two prices rather than carried over from the
+alternate's stored `saving`, because quantity belongs to the line and not to the
+candidate — the same reason `buildPlan()` owns every other number.
